@@ -1,31 +1,21 @@
 import { auth } from './firebase';
+import { resolveToken } from './authToken';
+import { ApiError } from './errors';
 
-export class ApiError extends Error {
-  status: number;
-  code?: string;
-  details?: unknown[];
+// Backward-compatible re-export: existing callers import ApiError from './api'.
+export { ApiError } from './errors';
 
-  constructor(message: string, status: number = 500, code?: string, details?: unknown[]) {
-    super(message);
-    this.name = 'ApiError';
-    this.status = status;
-    this.code = code;
-    this.details = details;
-    Object.setPrototypeOf(this, ApiError.prototype);
-  }
-}
 
 export async function authenticatedApi<T>(path: string, body?: unknown, method = 'POST'): Promise<T> {
-  let token = '';
-  if (auth.currentUser) {
-    token = await auth.currentUser.getIdToken();
-  }
+  // Hard invariant: if there is no authenticated Firebase user, fail fast
+  // locally instead of sending a deliberately headerless authenticated request.
+  const token = await resolveToken(auth.currentUser);
 
   const response = await fetch(path, {
     method,
     headers: {
       'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      Authorization: `Bearer ${token}`,
     },
     body: body === undefined ? undefined : JSON.stringify(body),
   });

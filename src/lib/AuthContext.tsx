@@ -119,17 +119,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       else clearAllAuthState();
       if (!cancelled) setSessionLoading(false);
     };
-    if (auth.currentUser) {
-      void resolveAndFinish(auth.currentUser);
-    }
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      void resolveAndFinish(user);
-    });
+    // Wait for the initial Firebase bootstrap (session restoration) to finish
+    // BEFORE registering the observer. onAuthStateChanged then becomes the
+    // SINGLE trigger that resolves the initial auth state and every subsequent
+    // change. There is no separate manual initial-resolution path, so
+    // /api/auth/me can never run before Firebase bootstrap is ready, and there
+    // is no duplicate initial trigger.
+    const unsubRef = { current: () => {} };
+    void (async () => {
+      await auth.authStateReady();
+      if (cancelled) return;
+      unsubRef.current = onAuthStateChanged(auth, (user) => {
+        void resolveAndFinish(user);
+      });
+    })();
+
     return () => {
       cancelled = true;
-      unsubscribe();
+      unsubRef.current();
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const logout = async () => {

@@ -4,6 +4,7 @@
 import { signInWithPopup, signOut, signInWithCustomToken } from 'firebase/auth';
 import { auth, googleProvider } from './firebase';
 import { ApiError } from './api';
+import { resolveToken } from './authToken';
 import type { Profile, DonorProfile, Institution, User } from '../types';
 
 export type Rev3NextStep = 'basic' | 'intent' | 'complete' | 'contact' | 'donor-profile';
@@ -32,7 +33,7 @@ async function postJson(path: string, body: unknown, token?: string, method: 'PO
 async function getJson(path: string, token: string) {
   const res = await fetch(path, {
     method: 'GET',
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    headers: { Authorization: `Bearer ${token}` },
   });
   const payload = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -42,9 +43,11 @@ async function getJson(path: string, token: string) {
   return payload as any;
 }
 
-async function getToken(): Promise<string> {
-  if (!auth.currentUser) return '';
-  return auth.currentUser.getIdToken();
+// Resolve the current Firebase ID token. Throws (locally, before any network
+// request) when there is no authenticated Firebase user — so authenticated
+// helpers never send a deliberately headerless request.
+function getToken(): Promise<string> {
+  return resolveToken(auth.currentUser);
 }
 
 // ── Google flow ───────────────────────────────────────────────────────────
