@@ -3,6 +3,7 @@ import { onAuthStateChanged, signOut, type User as FirebaseUser } from 'firebase
 import { auth } from './firebase';
 import { authenticatedApi } from './api';
 import { toLegacy } from './rev3Auth';
+import { beginResolution, isCurrentResponse, isResolvableMe } from './authSession';
 import type { User as DonorUser, Requester, HospitalUser, Institution, AdminUser, AuthState } from '../types';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -60,6 +61,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loggedInAdmin, setLoggedInAdmin] = useState<AdminUser | null>(null);
   const [loggedInInstitution, setLoggedInInstitution] = useState<Institution | null>(null);
   const lastResolvedUserIdRef = useRef<string | null>(null);
+  const authRequestSeqRef = useRef(0);
 
   // Clear every role/identity slot — used on explicit logout and whenever
   // Firebase reports a null session (external sign-out, token/account revoked,
@@ -74,40 +76,67 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   async function handleAuthUser(authUser?: FirebaseUser, forceRefresh = false) {
-    if (authUser && (forceRefresh || authUser.uid !== lastResolvedUserIdRef.current)) {
-      try {
+    if (!authUser) return;
+    // Begin a resolution request. If the same uid is already FULLY resolved (a
+    // real donor/requester/institution was produced) and we aren't forcing,
+    // skip — prevents a duplicate /api/auth/me per uid. Otherwise bump the
+    // sequence so stale in-flight responses can never overwrite newer state.
+    const { seq, proceeded } = beginResolution(
+      authRequestSeqRef.current,
+      lastResolvedUserIdRef.current,
+      authUser.uid,
+      forceRefresh
+    );
+    if (!proceeded) return;
+    authRequestSeqRef.current = seq;
+
+    try {
+      const authState = await authenticatedApi<AuthState & { institution?: Institution | null }>(
+        '/api/auth/me', undefined, 'GET'
+      );
+
+      // Stale guard: an older in-flight response (lower seq) must never write
+      // auth state — e.g. a pre-provisioning profile:null arriving AFTER a
+      // newer resolution already produced the populated profile.
+      if (!isCurrentResponse(authRequestSeqRef.current, seq)) return;
+
+      if (authState.institution) {
+        setLoggedInInstitution(authState.institution);
+        setLoggedInHospital(institutionToHospitalUser(authState.institution));
+      } else {
+        // No institution for the current identity — clear any stale hospital
+        // state so a prior institutional session can't bleed into a
+        // donor/requester resolution.
+        setLoggedInInstitution(null);
+        setLoggedInHospital(null);
+      }
+
+      // Donor/requester are resolved from `intent` via toLegacy() — the single
+      // authoritative role-resolution path. Roles are strictly mutually
+      // exclusive: a donor sets requester=null and vice-versa (never both).
+      // If the identity is institution-linked, toLegacy() yields neither, so
+      // donor/requester state is cleared (institutional is a separate path).
+      const me = authState as unknown as Parameters<typeof toLegacy>[0];
+      const legacyResolver = toLegacy(me);
+      if (legacyResolver.donor) {
+        setLoggedInUser(legacyResolver.donor);
+        setLoggedInRequester(null);
+      } else {
+        setLoggedInUser(null);
+        setLoggedInRequester(legacyResolver.requester);
+      }
+
+      // INVARIANT: only a RESOLVABLE outcome (donor / requester / institution)
+      // marks the UID as fully resolved. A pre-provisioning profile:null must
+      // NOT — otherwise the same UID could never resolve again after
+      // complete-verification provisions the profile.
+      if (isResolvableMe(me)) {
         lastResolvedUserIdRef.current = authUser.uid;
-        const authState = await authenticatedApi<AuthState & { institution?: Institution | null }>(
-          '/api/auth/me', undefined, 'GET'
-        );
-
-        if (authState.institution) {
-          setLoggedInInstitution(authState.institution);
-          setLoggedInHospital(institutionToHospitalUser(authState.institution));
-        } else {
-          // No institution for the current identity — clear any stale hospital
-          // state so a prior institutional session can't bleed into a
-          // donor/requester resolution.
-          setLoggedInInstitution(null);
-          setLoggedInHospital(null);
-        }
-
-        // Donor/requester are resolved from `intent` via toLegacy() — the single
-        // authoritative role-resolution path. Roles are strictly mutually
-        // exclusive: a donor sets requester=null and vice-versa (never both).
-        // If the identity is institution-linked, toLegacy() yields neither, so
-        // donor/requester state is cleared (institutional is a separate path).
-        const legacyResolver = toLegacy(authState as unknown as Parameters<typeof toLegacy>[0]);
-        if (legacyResolver.donor) {
-          setLoggedInUser(legacyResolver.donor);
-          setLoggedInRequester(null);
-        } else {
-          setLoggedInUser(null);
-          setLoggedInRequester(legacyResolver.requester);
-        }
-      } catch {
-        console.warn('[Auth] /api/auth/me failed, session may have expired');
-        if (!forceRefresh) lastResolvedUserIdRef.current = null;
+      }
+    } catch {
+      console.warn('[Auth] /api/auth/me failed, session may have expired');
+      if (isCurrentResponse(authRequestSeqRef.current, seq) && !forceRefresh) {
+        lastResolvedUserIdRef.current = null;
       }
     }
   }

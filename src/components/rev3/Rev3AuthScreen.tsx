@@ -7,6 +7,7 @@ import { auth, googleProvider } from '../../lib/firebase';
 import { signInWithPopup, onAuthStateChanged } from 'firebase/auth';
 import { completeGoogle, fetchMe } from '../../lib/rev3Auth';
 import type { Rev3NextStep } from '../../lib/rev3Auth';
+import { useAuth } from '../../lib/AuthContext';
 
 interface Rev3AuthProps {
  onContinue: (step: Rev3NextStep) => void;
@@ -19,6 +20,7 @@ const btnPrimary =
  'mt-6 flex h-12 w-full items-center justify-center gap-2 bg-blood-600 hover:bg-blood-700 text-sm font-semibold text-white transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blood-600 disabled:opacity-50 disabled:cursor-not-allowed select-none';
 
 export function Rev3AuthScreen({ onContinue, initialIntent }: Rev3AuthProps) {
+  const { refreshSession } = useAuth();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const startedRef = useRef(false);
@@ -61,7 +63,12 @@ export function Rev3AuthScreen({ onContinue, initialIntent }: Rev3AuthProps) {
   const user = result.user;
   const name = String(user.displayName || '');
   const profileResult = await completeGoogle(user.email || '', name, resolvedIntent);
- onContinue(profileResult.nextStep || (profileResult.isNewUser ? 'basic' : 'complete'));
+  // Re-resolve /api/auth/me AFTER provisioning so the freshly-created profile
+  // (never a stale pre-provisioning profile:null) becomes the authoritative
+  // AuthContext state before any route/dashboard reads it. refreshSession uses
+  // forceRefresh, which bypasses the resolved-uid guard and runs a fresh /me.
+  await refreshSession();
+  onContinue(profileResult.nextStep || (profileResult.isNewUser ? 'basic' : 'complete'));
  } catch (caught: any) {
  if (caught?.code === 'auth/popup-closed-by-user') {
  setLoading(false);

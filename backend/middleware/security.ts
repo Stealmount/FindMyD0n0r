@@ -79,7 +79,16 @@ export function applySecurityMiddleware(app: express.Express, port: number) {
     res.setHeader("X-Frame-Options", "DENY");
     res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
     res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(self)");
-    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+    // COOP: API responses keep the strong same-origin isolation. The HTML
+    // document (the Firebase signInWithPopup opener) must use unsafe-none so
+    // the cross-origin popup (findmydonor-0.firebaseapp.com) can post the auth
+    // result back to the opener — same-origin severs that channel and blocks
+    // Google popup login in production. Localhost works because the Vite dev
+    // server sends no COOP header.
+    res.setHeader(
+      "Cross-Origin-Opener-Policy",
+      req.path.startsWith("/api") ? "same-origin" : "unsafe-none"
+    );
 
     const isProd = process.env.NODE_ENV === "production";
     if (isProd) {

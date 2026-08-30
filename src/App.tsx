@@ -492,7 +492,20 @@ function Rev3AuthRoute({ nav, intent }: { nav: (view: string, push?: boolean, co
       navigate('/auth/rev3/onboarding');
       return;
     }
-    await checkUserAndRoute();
+    // Post-provisioning: the sign-in screen awaited AuthContext.refreshSession()
+    // before onContinue, so route from that canonical FRESH context state —
+    // never a stale fetchMe() memo from an uncoordinated /api/auth/me.
+    if (auth.loggedInUser && !auth.loggedInRequester) {
+      navigate('/donor-dashboard', { replace: true });
+    } else if (auth.loggedInRequester && !auth.loggedInUser) {
+      navigate('/requester-portal', { replace: true });
+    } else if (auth.loggedInInstitution) {
+      navigate('/institution/dashboard', { replace: true });
+    } else {
+      // Edge: no resolvable role yet (e.g. intent selector / return visitor
+      // without intent) — fall back to a fresh profile check.
+      await checkUserAndRoute();
+    }
   };
 
   const handleIntentSelected = async (_selectedIntent: 'donor' | 'requester') => {
