@@ -77,9 +77,14 @@ export async function fetchMe() {
     return getJson('/api/auth/me', token) as Promise<Rev3Me>;
   })();
   inFlightPromise = promise;
-  promise.finally(() => {
-    inFlightPromise = null;
-  });
+  // Reset the memo ref on both outcomes WITHOUT a detached derived promise.
+  // promise.finally(...) propagates a rejection to an unheld derived promise,
+  // producing "Uncaught (in promise) ApiError". .then(onOk, onErr) with both
+  // handlers returns a promise that always fulfills, so nothing leaks.
+  void promise.then(
+    () => { inFlightPromise = null; },
+    () => { inFlightPromise = null; }
+  );
   return promise;
 }
 
