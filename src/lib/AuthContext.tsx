@@ -1,0 +1,185 @@
+import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
+import { onAuthStateChanged, signOut, type User as FirebaseUser } from 'firebase/auth';
+import { auth } from './firebase';
+import { authenticatedApi } from './api';
+import { toLegacy } from './rev3Auth';
+import type { User as DonorUser, Requester, HospitalUser, Institution, AdminUser, AuthState } from '../types';
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/** Institution row → HospitalUser view-model. */
+export function institutionToHospitalUser(inst: Institution): HospitalUser {
+  return {
+    id: inst.id,
+    institution_type: inst.type,
+    hospital_name: inst.org_name,
+    registration_number: inst.registration_number,
+    admin_name: inst.contact_person,
+    email: inst.email,
+    phone: inst.phone,
+    address: inst.address,
+    pincode: inst.pincode,
+    city: inst.city,
+    status: inst.verification_status,
+    created_at: inst.created_at,
+    updated_at: inst.updated_at,
+  };
+}
+
+// ── Context shape ─────────────────────────────────────────────────────────────
+
+interface AuthContextValue {
+  loggedInUser: DonorUser | null;
+  loggedInRequester: Requester | null;
+  loggedInHospital: HospitalUser | null;
+  loggedInAdmin: AdminUser | null;
+  loggedInInstitution: Institution | null;
+  sessionLoading: boolean;
+
+  // Setters — for components that receive auth callbacks (AuthHub, dashboards)
+  setLoggedInUser: (u: DonorUser | null) => void;
+  setLoggedInRequester: (r: Requester | null) => void;
+  setLoggedInHospital: (h: HospitalUser | null) => void;
+  setLoggedInAdmin: (a: AdminUser | null) => void;
+  setLoggedInInstitution: (i: Institution | null) => void;
+
+  // High-level actions
+  logout: () => Promise<void>;
+  refreshSession: () => Promise<void>;
+}
+
+const AuthContext = createContext<AuthContextValue | null>(null);
+
+// ── Provider ──────────────────────────────────────────────────────────────────
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [loggedInUser, setLoggedInUser] = useState<DonorUser | null>(null);
+  const [loggedInRequester, setLoggedInRequester] = useState<Requester | null>(null);
+  const [sessionLoading, setSessionLoading] = useState(true);
+  const [loggedInHospital, setLoggedInHospital] = useState<HospitalUser | null>(null);
+  const [loggedInAdmin, setLoggedInAdmin] = useState<AdminUser | null>(null);
+  const [loggedInInstitution, setLoggedInInstitution] = useState<Institution | null>(null);
+  const lastResolvedUserIdRef = useRef<string | null>(null);
+
+  // Clear every role/identity slot — used on explicit logout and whenever
+  // Firebase reports a null session (external sign-out, token/account revoked,
+  // another tab). Prevents stale donor/requester/institution/admin state from
+  // leaking into a future login.
+  const clearAllAuthState = () => {
+    setLoggedInUser(null);
+    setLoggedInRequester(null);
+    setLoggedInHospital(null);
+    setLoggedInInstitution(null);
+    setLoggedInAdmin(null);
+  };
+
+  async function handleAuthUser(authUser?: FirebaseUser, forceRefresh = false) {
+    if (authUser && (forceRefresh || authUser.uid !== lastResolvedUserIdRef.current)) {
+      try {
+        lastResolvedUserIdRef.current = authUser.uid;
+        const authState = await authenticatedApi<AuthState & { institution?: Institution | null }>(
+          '/api/auth/me', undefined, 'GET'
+        );
+
+        if (authState.institution) {
+          setLoggedInInstitution(authState.institution);
+          setLoggedInHospital(institutionToHospitalUser(authState.institution));
+        } else {
+          // No institution for the current identity — clear any stale hospital
+          // state so a prior institutional session can't bleed into a
+          // donor/requester resolution.
+          setLoggedInInstitution(null);
+          setLoggedInHospital(null);
+        }
+
+        // Donor/requester are resolved from `intent` via toLegacy() — the single
+        // authoritative role-resolution path. Roles are strictly mutually
+        // exclusive: a donor sets requester=null and vice-versa (never both).
+        // If the identity is institution-linked, toLegacy() yields neither, so
+        // donor/requester state is cleared (institutional is a separate path).
+        const legacyResolver = toLegacy(authState as unknown as Parameters<typeof toLegacy>[0]);
+        if (legacyResolver.donor) {
+          setLoggedInUser(legacyResolver.donor);
+          setLoggedInRequester(null);
+        } else {
+          setLoggedInUser(null);
+          setLoggedInRequester(legacyResolver.requester);
+        }
+      } catch {
+        console.warn('[Auth] /api/auth/me failed, session may have expired');
+        if (!forceRefresh) lastResolvedUserIdRef.current = null;
+      }
+    }
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    const resolveAndFinish = async (user: FirebaseUser | null) => {
+      if (user) await handleAuthUser(user);
+      else clearAllAuthState();
+      if (!cancelled) setSessionLoading(false);
+    };
+    if (auth.currentUser) {
+      void resolveAndFinish(auth.currentUser);
+    }
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      void resolveAndFinish(user);
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const logout = async () => {
+    try {
+      lastResolvedUserIdRef.current = null;
+      await signOut(auth);
+    } catch (error) {
+      console.error('Firebase signOut failed:', error);
+    }
+    clearAllAuthState();
+  };
+
+  const refreshSession = async () => {
+    if (auth.currentUser) {
+      await auth.currentUser.getIdToken(true);
+      await handleAuthUser(auth.currentUser, true);
+    }
+  };
+
+  return (
+    <AuthContext.Provider value={{
+      loggedInUser,
+      loggedInRequester,
+      loggedInHospital,
+      loggedInAdmin,
+      loggedInInstitution,
+      sessionLoading,
+      setLoggedInUser,
+      setLoggedInRequester,
+      setLoggedInHospital,
+      setLoggedInAdmin,
+      setLoggedInInstitution,
+      logout,
+      refreshSession,
+    }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+// ── Hook ──────────────────────────────────────────────────────────────────────
+
+/**
+ * useAuth() — consume auth state and actions anywhere in the component tree
+ * without prop drilling.
+ *
+ * Must be used inside <AuthProvider>.
+ */
+export function useAuth(): AuthContextValue {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error('useAuth() must be used inside <AuthProvider>');
+  return ctx;
+}

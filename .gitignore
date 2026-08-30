@@ -1,0 +1,62 @@
+node_modules/
+build/
+dist/
+dist-admin/
+coverage/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Environment
+.env*
+!.env.example
+
+# Secrets and deployment artifacts
+key/
+.ssh-key/
+*.key
+*.pem
+*.p12
+*.pfx
+
+deploy.tar
+deploy.tar.gz
+*.tar
+*.zip
+*.rar
+*.7z
+
+# managed
+data/db_*.json
+**.node-persist**
+**_IGNORE_**
+# end managed
+
+# Vite
+.vite/
+
+# TypeScript
+*.tsbuildinfo
+
+# IDE
+.vscode/
+.idea/
+
+# PM2
+*.pid
+pids/
+
+# Local caches
+.cache/
+tmp/
+temp/
+scratch/
+.deleted/
+
+# Agent scratch
+.gemini/

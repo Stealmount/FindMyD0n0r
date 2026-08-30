@@ -1,0 +1,36 @@
+[
+  {
+    "account_status": "deleted",
+    "id": "admin-test-donor-0001",
+    "full_name": "Admin Test Donor Updated",
+    "updated_at": "2026-08-15T18:19:56.119Z"
+  },
+  {
+    "full_name": "Deleted Auth User",
+    "phone": "919980000003",
+    "account_status": "deleted",
+    "created_at": "2026-08-15T18:13:45.959Z",
+    "updated_at": "2026-08-15T18:13:45.959Z",
+    "id": "deleted-auth-0001"
+  },
+  {
+    "full_name": "Active Auth User",
+    "phone": "919980000004",
+    "account_status": "active",
+    "created_at": "2026-08-15T18:13:45.960Z",
+    "updated_at": "2026-08-15T18:13:45.960Z",
+    "id": "active-auth-0002"
+  },
+  {
+    "full_name": "Deleted Test Auth User",
+    "phone": "919980000005",
+    "whatsapp_number": "919980000005",
+    "blood_type": "A+",
+    "pincode": "110002",
+    "availability_status": "unavailable",
+    "account_status": "deleted",
+    "created_at": "2026-08-15T18:13:45.961Z",
+    "updated_at": "2026-08-15T18:13:45.961Z",
+    "id": "test-user-id"
+  }
+]

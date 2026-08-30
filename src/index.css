@@ -1,0 +1,164 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Inter+Tight:wght@600;700;800;900&family=JetBrains+Mono:wght@400;500;700&family=Noto+Sans+Devanagari:wght@400;500;600;700&family=Hind:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", "Noto Sans Devanagari", "Hind", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Inter Tight", "Inter", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  /* ── Swiss Design System tokens (design-system.md §5.2) ── */
+  /* Primary: blood crimson */
+  --color-blood-50: #FEF2F3;
+  --color-blood-100: #FCE4E7;
+  --color-blood-200: #F9C3CA;
+  --color-blood-300: #F39AA6;
+  --color-blood-400: #EA6478;
+  --color-blood-500: #DE2F49;
+  --color-blood-600: #C8102E;
+  --color-blood-700: #A50D27;
+  --color-blood-800: #7C0A1E;
+  --color-blood-900: #520715;
+  --color-blood-950: #38050D;
+
+  /* Secondary: pure ink neutrals */
+  --color-ink-50: #FAFAFA;
+  --color-ink-100: #F5F5F5;
+  --color-ink-200: #E6E6E6;
+  --color-ink-300: #CCCCCC;
+  --color-ink-400: #999999;
+  --color-ink-500: #666666;
+  --color-ink-600: #4D4D4D;
+  --color-ink-700: #333333;
+  --color-ink-800: #1C1C1C;
+  --color-ink-850: #141414;
+  --color-ink-900: #0A0A0A;
+  --color-ink-950: #050505;
+
+  /* Accent: clinical teal-green */
+  --color-vital-50: #EEF9F6;
+  --color-vital-100: #D6F0EA;
+  --color-vital-200: #ADE1D5;
+  --color-vital-300: #79CCBB;
+  --color-vital-400: #43B19D;
+  --color-vital-500: #19967F;
+  --color-vital-600: #0E8574;
+  --color-vital-700: #0C685C;
+  --color-vital-800: #095047;
+  --color-vital-900: #073831;
+  --color-vital-950: #04241F;
+
+  /* Fixed external brands */
+  --color-whatsapp: #25D366;
+  --color-google: #4285F4;
+}
+
+:root {
+  --background: #FAFAFA;
+  --foreground: #0A0A0A;
+  --muted: #666666;
+  --border: #E6E6E6;
+}
+
+body {
+  background-color: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  overflow-x: hidden;
+}
+
+/* Custom Scrollbar — neutral spec (§10.3) */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: #F5F5F5;
+}
+::-webkit-scrollbar-thumb {
+  background: #CCCCCC;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #999999;
+}
+
+::selection {
+  background: #C8102E;
+  color: #ffffff;
+}
+
+/* Grid pattern — THE Swiss texture (single definition each, 64px hairlines) */
+.grid-pattern {
+  background-image:
+    linear-gradient(to right, rgba(10, 10, 10, 0.05) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(10, 10, 10, 0.05) 1px, transparent 1px);
+  background-size: 64px 64px;
+}
+
+.grid-pattern-dark {
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+  background-size: 64px 64px;
+  mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, black 30%, transparent 80%);
+}
+
+/* Entrance animation (kept — canonical micro entrance) */
+.animate-fade-in {
+  animation: institutional-fadein 0.35s ease-out both;
+}
+@keyframes institutional-fadein {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* Hide scrollbar on marquees */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* Leaflet popup — flat chrome (§8.3) */
+.leaflet-popup-content-wrapper,
+.leaflet-popup-tip {
+  box-shadow: none;
+  border-radius: 0;
+}
+.leaflet-popup-content {
+  font-family: var(--font-sans);
+  font-size: 13px;
+}
+
+/* Hindi Devanagari Typography Symmetry & Alignment Fix */
+[data-lang="HI"] {
+  font-family: "Noto Sans Devanagari", "Hind", "Inter", sans-serif !important;
+}
+
+[data-lang="HI"] h1,
+[data-lang="HI"] h2,
+[data-lang="HI"] h3,
+[data-lang="HI"] h4,
+[data-lang="HI"] .font-serif,
+[data-lang="HI"] .tracking-tight,
+[data-lang="HI"] .tracking-tighter {
+  font-family: "Noto Sans Devanagari", "Hind", sans-serif !important;
+  letter-spacing: 0 !important;
+  line-height: 1.45 !important;
+  font-style: normal !important;
+}
+
+[data-lang="HI"] p,
+[data-lang="HI"] span,
+[data-lang="HI"] div,
+[data-lang="HI"] button,
+[data-lang="HI"] input {
+  font-family: "Noto Sans Devanagari", "Hind", "Inter", sans-serif;
+  letter-spacing: normal !important;
+}
+
+/* Reduced motion (§9.3) */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

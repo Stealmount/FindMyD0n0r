@@ -1,0 +1,10 @@
+User-agent: *
+Allow: /
+Disallow: /donor-dashboard
+Disallow: /requester-portal
+Disallow: /admin
+Disallow: /admin-login
+Disallow: /admin-dashboard
+Disallow: /hospital-dashboard
+
+Sitemap: https://findmydonor.online/sitemap.xml

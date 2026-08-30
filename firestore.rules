@@ -1,0 +1,93 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isAuth() {
+      return request.auth != null;
+    }
+    function isAdmin() {
+      return isAuth() && request.auth.token.email in ['ADMIN_EMAIL_PLACEHOLDER'];
+    }
+    function isOwner(userId) {
+      return isAuth() && request.auth.uid == userId;
+    }
+
+    match /profiles/{userId} {
+      allow read: if isAuth();
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId) || isAdmin();
+      allow delete: if isAdmin();
+    }
+    match /donor_profiles/{userId} {
+      allow read: if isAuth();
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId) || isAdmin();
+      allow delete: if isAdmin();
+    }
+    match /blood_requests/{docId} {
+      allow read: if true;
+      allow create: if isAuth();
+      allow update: if isAuth() && (resource.data.requester_id == request.auth.uid || isAdmin());
+      allow delete: if isAdmin();
+    }
+    match /matches/{docId} {
+      allow read: if isAuth();
+      allow create: if isAuth();
+      allow update: if isAuth() && (resource.data.donor_id == request.auth.uid || isAdmin());
+      allow delete: if isAdmin();
+    }
+    match /notifications/{docId} {
+      allow read: if isAuth() && resource.data.user_id == request.auth.uid;
+      allow create: if isAdmin();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+    match /institutions/{docId} {
+      allow read: if true;
+      allow create: if isAuth();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+    match /institution_profile_links/{docId} {
+      allow read: if isAuth();
+      allow create: if isAuth();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+    match /auth_profile_links/{docId} {
+      allow read: if isAuth();
+      allow create: if isAuth();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+    match /message_queue/{docId} {
+      allow read, write: if isAdmin();
+    }
+    match /request_events/{docId} {
+      allow read: if isAuth();
+      allow create: if isAuth();
+      allow update, delete: if isAdmin();
+    }
+    match /request_reports/{docId} {
+      allow read: if isAdmin();
+      allow create: if isAuth();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+    match /blood_banks/{docId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /donation_camps/{docId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /eraktkosh_sync_logs/{docId} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+    match /users/{docId} {
+      allow read: if isAuth();
+      allow write: if isAuth() || isAdmin();
+    }
+  }
+}
