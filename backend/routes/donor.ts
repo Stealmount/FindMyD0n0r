@@ -7,7 +7,7 @@ import { cacheGet, cacheSet, cacheInvalidatePrefix } from "../src/lib/redisCache
 import { getAuthenticatedUser, getLinkedProfile } from "../middleware/auth";
 import rateLimitMiddleware from "../middleware/rateLimiter";
 import { normalizePhone, isValidIndianPhone } from "../helpers/phone";
-import { nowISO, nowDate, daysFromNow } from "../helpers/time";
+import { nowISO, nowDate, resolveCooldownDays, computeCooldownUntil } from "../helpers/time";
 import { sendWhatsApp, buildWelcomeMessage } from "../src/lib/waha";
 import { validate } from "../validation";
 import { sendErrorResponse, UnauthorizedError, NotFoundError, ForbiddenError, ValidationError, AppError } from "../helpers/errors";
@@ -93,7 +93,7 @@ router.patch("/api/donor-profile/complete", rateLimitMiddleware(10, 60_000), wra
     linked.profile.whatsapp_verified = true;
   }
 
-  const { blood_group, pincode, area, city, last_donation_date, health_self_declaration, emergency_only, number_sharing_pref, weight_kg } = req.body || {};
+  const { blood_group, pincode, area, city, last_donation_date, health_self_declaration, emergency_only, number_sharing_pref, weight_kg, cooldown_days } = req.body || {};
 
   const VALID_BLOOD_GROUPS = new Set(["A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"]);
   if (!blood_group || !VALID_BLOOD_GROUPS.has(String(blood_group))) return sendErrorResponse(res, new ValidationError("Valid blood group required."));
@@ -105,12 +105,17 @@ router.patch("/api/donor-profile/complete", rateLimitMiddleware(10, 60_000), wra
     if (!Number.isInteger(w) || w < 45) return sendErrorResponse(res, new ValidationError("Weight must be a whole number of at least 45 kg."));
   }
 
+  // Donor-selectable cooldown period (60/90/120) — reject invalid values on
+  // onboarding; default applied at read time for legacy donors.
+  let donorCooldownDays: 60 | 90 | 120 = 90;
+  if (cooldown_days !== undefined && cooldown_days !== null && cooldown_days !== '') {
+    const cd = Number(cooldown_days);
+    if (![60, 90, 120].includes(cd)) return sendErrorResponse(res, new ValidationError("Cooldown period must be 60, 90, or 120 days."));
+    donorCooldownDays = cd as 60 | 90 | 120;
+  }
+
   const cooldown_until = last_donation_date
-    ? (() => {
-        const d = new Date(last_donation_date);
-        d.setDate(d.getDate() + 90);
-        return d.toISOString().split("T")[0];
-      })()
+    ? computeCooldownUntil(String(last_donation_date), donorCooldownDays)
     : null;
 
   const today = nowDate();
@@ -124,6 +129,7 @@ router.patch("/api/donor-profile/complete", rateLimitMiddleware(10, 60_000), wra
     weight_kg: weight_kg ? Number(weight_kg) : null,
     last_donation_date: last_donation_date || null,
     cooldown_until,
+    cooldown_days: donorCooldownDays,
     health_self_declaration: true,
     profile_complete: true,
     is_available,
@@ -148,6 +154,7 @@ router.patch("/api/donor-profile/complete", rateLimitMiddleware(10, 60_000), wra
     availability_status: is_available ? "available" : "unavailable",
     emergency_only: Boolean(emergency_only),
     number_sharing_pref: number_sharing_pref || "on_approval",
+    cooldown_days: donorCooldownDays,
     whatsapp_verified: true,
     profile_complete: true,
     account_status: "active",
@@ -192,9 +199,40 @@ router.patch("/api/donor-profile/availability", rateLimitMiddleware(30, 60_000),
   }
   const availData = { is_available: available, updated_at: nowISO() };
   await updateDoc("donor_profiles", linked.profile.id, availData);
+  // Mirror availability onto the users doc so full-scan matching paths
+  // (which read users.availability_status) never see a stale snapshot.
+  try {
+    await saveDoc("users", linked.profile.id, {
+      availability_status: available ? "available" : "unavailable",
+      updated_at: nowISO(),
+    });
+  } catch (e: any) {
+    console.warn("[Availability] users mirror write failed:", e?.message || e);
+  }
   const data = { profile_id: linked.profile.id, ...linked.donorProfile, ...availData };
   await cacheInvalidatePrefix("eligible_");
   return res.json({ donorProfile: data });
+}));
+
+// ─── Donor cooldown preference (60/90/120) ───────────────────────────────────
+router.patch("/api/donor-profile/cooldown", rateLimitMiddleware(30, 60_000), wrap(async (req, res) => {
+  const authUser = await getAuthenticatedUser(req);
+  if (!authUser) return sendErrorResponse(res, new UnauthorizedError("Sign in is required."));
+  const linked = await getLinkedProfile(authUser.id);
+  if (!linked?.profile?.id) return sendErrorResponse(res, new NotFoundError("Profile not found."));
+  const cd = Number(req.body?.cooldown_days);
+  if (![60, 90, 120].includes(cd)) return sendErrorResponse(res, new ValidationError("Cooldown period must be 60, 90, or 120 days."));
+  const cooldownDays = cd as 60 | 90 | 120;
+  // Persist the preference on the users doc (authoritative cooldown state) and
+  // mirror it on donor_profiles. `users.cooldown_until` remains untouchable here.
+  await dbSaveDoc("users", linked.profile.id, { cooldown_days: cooldownDays, updated_at: nowISO() });
+  try {
+    await updateDoc("donor_profiles", linked.profile.id, { cooldown_days: cooldownDays, updated_at: nowISO() });
+  } catch (e: any) {
+    console.warn("[CooldownPref] donor_profiles mirror write failed:", e?.message || e);
+  }
+  await cacheInvalidatePrefix("eligible_");
+  return res.json({ success: true, cooldown_days: cooldownDays });
 }));
 
 // ─── Legacy donor creation (disabled) ────────────────────────────────────────
@@ -352,7 +390,14 @@ router.get("/api/donor/matches", wrap(async (req, res) => {
   });
 
   const donationLogs = allLogs.filter((log) => log.donor_id === donorId || log.donor_id === authUser.id);
-  return res.json({ matches: matchesProjected, requests: requestsProjected, donationLogs });
+  // Surface the donor's selected cooldown so the UI can render/persist it.
+  const donorUser = await dbGetDoc<User>("users", donorId);
+  return res.json({
+    matches: matchesProjected,
+    requests: requestsProjected,
+    donationLogs,
+    cooldown_days: donorUser?.cooldown_days ?? 90,
+  });
 }));
 
 // ─── Pending matches by donor phone ──────────────────────────────────────────
@@ -420,18 +465,19 @@ router.post("/api/donor/matches/:matchId/confirm", (req, res, next) => {
     // date is used as-is; anything invalid/future falls back to today.
     const rawDate = String(req.body.donation_date || "");
     let donationDate = nowDate();
-    let cooldownEnd = daysFromNow(60);
-    if (/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(rawDate) && !Number.isNaN(new Date(`${rawDate}T00:00:00Z`).getTime())) {
       const parsed = new Date(`${rawDate}T00:00:00Z`);
-      if (!Number.isNaN(parsed.getTime()) && parsed.getTime() <= Date.now()) {
-        donationDate = rawDate;
-        cooldownEnd = new Date(parsed.getTime() + 60 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-      }
+      if (parsed.getTime() <= Date.now()) donationDate = rawDate;
     }
+    // Donor-selected cooldown period (60/90/120), defaulting to 90.
+    const cooldownStr = computeCooldownUntil(donationDate, resolveCooldownDays(donor));
 
+    // Deterministic per-donor-per-date key — a repeated self-report is idempotent
+    // and never duplicates history across retries.
+    const logId = `donation_self_${donor.id}_${donationDate}`;
     await Promise.all([
-      dbSaveDoc("donation_log", `donation_self_${donor.id}_${Date.now()}`, {
-        id: `donation_self_${donor.id}_${Date.now()}`,
+      dbSaveDoc("donation_log", logId, {
+        id: logId,
         donor_id: donor.id,
         match_id: null,
         request_id: null,
@@ -442,7 +488,7 @@ router.post("/api/donor/matches/:matchId/confirm", (req, res, next) => {
       }),
       dbSaveDoc("users", donor.id, {
         ...donor,
-        cooldown_until: cooldownEnd,
+        cooldown_until: cooldownStr,
         account_status: "cooldown",
         last_donation_date: donationDate,
         updated_at: nowISO(),

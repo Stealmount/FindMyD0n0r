@@ -149,7 +149,7 @@ describe('Admin endpoints', () => {
       user_id: 'test-admin-id',
       full_name: 'Admin Test Auth User',
       phone: '919980000006',
-      email: 'admin@findmydonor.online',
+      email: 'official@findmydonor.online',
       account_status: 'active',
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString()

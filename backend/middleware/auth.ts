@@ -45,11 +45,11 @@ export async function getAuthenticatedUser(req: express.Request) {
   let authUser: any = null;
   // Phase 7.2: short-lived admin JWT issued by /api/admin/verify-key.
   if (isAdminJwt(token)) {
-    authUser = { id: "admin-id", email: "admin@findmydonor.online", role: "admin" };
+    authUser = { id: "admin-id", email: "official@findmydonor.online", role: "admin" };
   } else if (token === "test-valid-token" && (process.env.NODE_ENV === "test" || process.env.TEST_MODE === "1")) {
     authUser = { id: "test-user-id", email: "test@example.com" };
   } else if (token === "test-admin-token" && (process.env.NODE_ENV === "test" || process.env.TEST_MODE === "1")) {
-    authUser = { id: "test-admin-id", email: "admin@findmydonor.online" };
+    authUser = { id: "test-admin-id", email: "official@findmydonor.online" };
   } else {
     // Firebase ID tokens are always three dot-separated base64url segments.
     // Anything else (stale mock token, extension header, truncated string)

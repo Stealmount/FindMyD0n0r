@@ -37,7 +37,7 @@ export default function Overview({ donors, requests, matches, notifications, don
   }, []);
 
   const totalDonors = metrics?.totalDonors ?? donors.length;
-  const activeRequests = metrics?.activeRequests ?? requests.filter(r => ['open', 'broadcasting', 'matching', 'partially_matched'].includes(r.status)).length;
+  const activeRequests = metrics?.activeRequests ?? requests.filter(r => ['open', 'broadcasting', 'matching', 'partially_matched', 'secured', 'search_exhausted'].includes(r.status)).length;
   const hospitals = metrics?.hospitals ?? institutions.filter((i: any) => i.verification_status === 'verified').length;
   const totalUsers = metrics?.totalUsers ?? (donors.length + requesters.length);
 
@@ -56,7 +56,7 @@ export default function Overview({ donors, requests, matches, notifications, don
   const fulfilled = matches.filter(m => m.outcome === 'donated').length;
   const pending = matches.filter(m => m.donor_response === 'pending').length;
 
-  const byStatus = (['open', 'partially_matched', 'fulfilled', 'cancelled', 'expired'] as const).map(s => ({
+  const byStatus = (['open', 'partially_matched', 'secured', 'search_exhausted', 'fulfilled', 'cancelled', 'expired'] as const).map(s => ({
     s, n: requests.filter(r => r.status === s).length,
   })).filter(x => x.n > 0);
 

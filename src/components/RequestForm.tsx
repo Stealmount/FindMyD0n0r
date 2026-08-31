@@ -142,7 +142,6 @@ export default function RequestForm({ onSuccess, loggedInRequester, onNavigate }
         requester_email: loggedInRequester?.email || '',
         status: 'broadcasting',
         showcase_opt_in: false,
-        broadcast_to_simulator: false,
         share_contact_immediately: false,
       });
       onSuccess(response.trackingCode);
@@ -168,7 +167,6 @@ export default function RequestForm({ onSuccess, loggedInRequester, onNavigate }
         requester_email: loggedInRequester?.email || '',
         status: 'draft',
         showcase_opt_in: false,
-        broadcast_to_simulator: false,
         share_contact_immediately: false,
       });
       onSuccess(response.trackingCode);

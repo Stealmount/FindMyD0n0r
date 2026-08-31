@@ -6,7 +6,7 @@ import { auth } from '../../lib/firebase';
 import { AdminUser } from '../../types';
 import { useLanguage } from '../../lib/LanguageContext';
 
-const ADMIN_EMAIL = import.meta.env?.VITE_ADMIN_EMAIL || 'admin@findmydonor.online';
+const ADMIN_EMAIL = import.meta.env?.VITE_ADMIN_EMAIL || 'official@findmydonor.online';
 
 interface AdminLoginProps {
  onLogin: (admin: AdminUser) => void;
@@ -120,7 +120,7 @@ export function AdminLogin({ onLogin, onBack }: AdminLoginProps) {
  value={email}
  onChange={(e) => { setEmail(e.target.value); setError(''); }}
  className="w-full bg-ink-950 border border-ink-700 pl-12 pr-4 py-3.5 text-white placeholder:text-ink-500 focus:outline-none focus:border-blood-500 focus:outline-1 focus:outline-offset-0 focus:outline-blood-500 transition-colors font-mono"
- placeholder="admin@findmydonor.online"
+ placeholder="official@findmydonor.online"
  required
  />
  </div>

@@ -170,3 +170,35 @@ export function computeApprovedSlots(matches: MatchWithSlots[], requestId: strin
   }
   return Array.from(taken).sort((a, b) => a - b);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Capacity release (the ONLY ledger writer that frees a slot)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Release an approved donor's claimed unit slot so the lowest-free-slot loop can
+ * re-issue it. Called when an approved donor is authoritatively marked
+ * `not_donated` (donation-not-completed). SREM is the only SREM against the
+ * capslot ledger; the claim (SADD) is the only other writer, so the ledger stays
+ * coherent and the request's open slots correctly re-open.
+ */
+const RELEASE_SCRIPT = `
+local n = redis.call('SREM', KEYS[1], ARGV[1])
+return n
+`;
+
+export async function releaseApprovedSlot(
+  requestId: string,
+  unitSlot: number | null | undefined
+): Promise<void> {
+  if (unitSlot == null || !Number.isInteger(Number(unitSlot))) return;
+  if (!isUpstashConfigured()) return; // no real ledger in local best-effort mode
+  const slot = String(unitSlot);
+  const ledgerKey = slotsKey(requestId);
+
+  try {
+    await getUpstash().eval(RELEASE_SCRIPT, [ledgerKey], [slot]);
+  } catch (e: any) {
+    console.warn(`[Capacity] releaseApprovedSlot failed for request ${requestId} slot ${slot}:`, e?.message);
+  }
+}

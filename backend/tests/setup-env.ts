@@ -11,4 +11,4 @@ process.env.TEST_MODE = '1';
 process.env.UPSTASH_KEY_PREFIX = 'fmdt:';
 // Test backdoor identity must pass the ADMIN_EMAILS allowlist regardless of
 // local .env drift (dotenv never overrides existing vars).
-process.env.ADMIN_EMAILS = 'admin@findmydonor.online';
+process.env.ADMIN_EMAILS = 'official@findmydonor.online';

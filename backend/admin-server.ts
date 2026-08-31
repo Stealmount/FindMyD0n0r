@@ -1,5 +1,7 @@
 import "dotenv/config";
 import { randomUUID, timingSafeEqual } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import path from "path";
 import express from "express";
 import { getCollection as dbGetCollection, getDoc as dbGetDoc, saveDoc as dbSaveDoc } from "./src/lib/serverDb";
 import { getDoc as storeGet, saveDoc as storeSave, getAll as storeGetAll } from "./src/lib/store";
@@ -12,6 +14,7 @@ import { cacheInvalidatePrefix, cacheDel } from "./src/lib/redisCache";
 import { signAdminToken, isAdminJwt } from "./middleware/jwt";
 import { isOriginAllowed } from "./middleware/security";
 import { sendErrorResponse, NotFoundError, AppError } from "./helpers/errors";
+import { computeCooldownUntil, resolveCooldownDays } from "./helpers/time";
 import type { AuthProfileLink, BloodRequest, DonationLog, DonorProfile, Match, NotificationLog, Profile, Requester, User } from "./src/types";
 
 function nowISO(): string {
@@ -45,12 +48,12 @@ async function getAuthenticatedUser(req: express.Request) {
 
   // Test-mode backdoor (only when TEST_MODE=1 or NODE_ENV=test).
   if (isTestMode() && token === "test-admin-token") {
-    return { id: "test-admin-id", email: "admin@findmydonor.online" } as any;
+    return { id: "test-admin-id", email: "official@findmydonor.online" } as any;
   }
 
   // Phase 7.2: short-lived admin JWT issued by /api/admin/verify-key.
   if (isAdminJwt(token)) {
-    return { id: "admin-id", email: "admin@findmydonor.online", role: "admin" } as any;
+    return { id: "admin-id", email: "official@findmydonor.online", role: "admin" } as any;
   }
 
   // Real Firebase session (admin email must be in ADMIN_EMAILS).
@@ -123,7 +126,7 @@ async function startAdminServer() {
 
   const adminCheck = async (req: express.Request, res: express.Response, next: express.NextFunction) => {
     const authUser = await getAuthenticatedUser(req);
-    const adminEmails = (process.env.ADMIN_EMAILS || "admin@findmydonor.online").split(",").map(e => e.trim().toLowerCase());
+    const adminEmails = (process.env.ADMIN_EMAILS || "official@findmydonor.online").split(",").map(e => e.trim().toLowerCase());
     if (!authUser || !authUser.email || !adminEmails.includes(authUser.email.toLowerCase())) {
       return res.status(403).json({ error: "Access denied." });
     }
@@ -153,6 +156,35 @@ async function startAdminServer() {
       dbGetCollection<DonationLog>("donation_log")
     ]);
     return res.json({ users, blood_requests, matches, notifications, donation_log });
+  });
+
+  // ─── Overview metrics (Admin Console Overview tab) ────────────────────────
+  app.get("/api/admin/metrics", adminCheck, async (req, res) => {
+    const [users, blood_requests, institutions, notifications] = await Promise.all([
+      dbGetCollection<User>("users"),
+      dbGetCollection<BloodRequest>("blood_requests"),
+      dbGetCollection<any>("institutions"),
+      dbGetCollection<NotificationLog>("notifications"),
+    ]);
+    const totalDonors = users.filter(u => u.blood_type).length;
+    const activeRequests = blood_requests.filter(r =>
+      ["open", "broadcasting", "matching", "partially_matched"].includes(r.status)
+    ).length;
+    const hospitals = institutions.filter(i => i.verification_status === "verified").length;
+    const totalUsers = users.length;
+    const recentActivity = [...notifications]
+      .sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""))
+      .slice(0, 5)
+      .map(n => ({
+        id: n.id,
+        message: n.message_body,
+        event: n.trigger_event,
+        time: n.created_at,
+      }));
+    return res.json({
+      success: true,
+      metrics: { totalDonors, activeRequests, hospitals, totalUsers, recentActivity },
+    });
   });
 
   // ─── Reports summary (aggregated counts from existing collections) ───────
@@ -270,26 +302,26 @@ async function startAdminServer() {
   app.post("/api/admin/donors/:donorId/log-donation", adminCheck, async (req, res) => {
     const donor = await dbGetDoc<User>("users", req.params.donorId);
     if (!donor) return res.status(404).json({ error: "Donor not found" });
-    const now = new Date();
-    const cooldownEnd = new Date(now.getTime() + 60 * 24 * 60 * 60 * 1000);
-    const cooldownStr = cooldownEnd.toISOString().split("T")[0];
+    const nowISO = new Date().toISOString();
+    const donationDate = nowISO.split("T")[0];
+    const cooldownStr = computeCooldownUntil(donationDate, resolveCooldownDays(donor));
     await dbSaveDoc("users", donor.id, {
       ...donor,
       account_status: "cooldown",
       cooldown_until: cooldownStr,
-      last_donation_date: now.toISOString().split("T")[0],
-      updated_at: now.toISOString(),
+      last_donation_date: donationDate,
+      updated_at: nowISO,
     });
-    const logId = randomUUID();
+    const logId = `admin_log_${donor.id}_${donationDate}`;
     await dbSaveDoc("donation_log", logId, {
       id: logId,
       donor_id: donor.id,
       match_id: null,
       request_id: null,
-      donation_date: now.toISOString().split("T")[0],
+      donation_date: donationDate,
       source: "admin_entered",
       notes: "Cooldown forced by administrator override.",
-      created_at: now.toISOString(),
+      created_at: nowISO,
     });
     return res.json({ success: true });
   });
@@ -519,6 +551,20 @@ async function startAdminServer() {
     // Addition 1: a requester may also be a donor — bust cache just in case.
     await invalidateProfileCaches(requester.id);
     return res.json({ success: true, requester: updated });
+  });
+
+  // ─── Request status override (Admin Console Requests tab) ─────────────────
+  app.patch("/api/admin/requests/:requestId", adminCheck, async (req, res) => {
+    const request = await dbGetDoc<BloodRequest>("blood_requests", req.params.requestId);
+    if (!request) return sendErrorResponse(res, new NotFoundError("Request not found"));
+    const { status } = req.body || {};
+    if (!status || !["open", "fulfilled", "cancelled", "broadcasting", "matching"].includes(status)) {
+      return sendErrorResponse(res, new AppError("Valid status required: open, fulfilled, cancelled, broadcasting, matching", 400, "VALIDATION_ERROR"));
+    }
+    const updated: Record<string, unknown> = { ...request, status, updated_at: nowISO() };
+    if (status === "fulfilled") updated.fulfilled_at = nowISO();
+    await dbSaveDoc("blood_requests", request.id, updated);
+    return res.json({ success: true, request: updated });
   });
 
   app.post("/api/admin/matches", adminCheck, async (req, res) => {
@@ -830,9 +876,20 @@ async function startAdminServer() {
     });
   });
 
-  if (process.env.NODE_ENV !== "production") {
-    app.get("*", (_req, res) => res.status(200).json({ service: "admin-api", ok: true }));
-  }
+  // ─── Admin SPA (static build) ─────────────────────────────────────────────
+  // Serve the built Admin UI (dist/) for every non-API GET so port 6001 is the
+  // self-contained Admin portal. Built assets plus an SPA fallback give working
+  // deep routes (/admin/login, /admin/dashboard) on refresh. No CSP-nonce
+  // injection needed: this server sets no CSP/helmet headers, so the literal
+  // __CSP_NONCE__ placeholders in index.html are inert here.
+  const distPath = path.join(process.cwd(), "dist");
+  // Port 6001 is the Admin portal — its root must land on the admin login,
+  // not the public homepage (which is "/" in the SPA).
+  app.get("/", (_req, res) => res.redirect(302, "/admin/login"));
+  app.use(express.static(distPath));
+  app.get("*", async (_req, res) => {
+    res.type("html").send(await readFile(path.join(distPath, "index.html"), "utf8"));
+  });
 
   // ─── Global Error Middleware ───────────────────────────────────────────────
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {

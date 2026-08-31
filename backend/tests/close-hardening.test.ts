@@ -42,7 +42,6 @@ import { saveDoc as dbSaveDoc, getDoc as dbGetDoc, getCollection as dbGetCollect
 import { cacheGet, cacheSetNX } from '../src/lib/redisCache';
 import {
   matchAndNotifyRequest,
-  createNextDonorMatch,
   acquireDonorLock,
   releaseDonorLock,
   transitionRequestStatusIfActive,
@@ -165,8 +164,8 @@ describe('Phase 8 close-lifecycle hardening', () => {
     const result = await matchAndNotifyRequest(stale); // STALE snapshot, not a reload
     assert.equal(result.matched, 0, 'stale snapshot must never create matches');
 
-    const cascade = await createNextDonorMatch(stale);
-    assert.equal(cascade, null, 'stale snapshot must never cascade a match');
+    const cascade = await matchAndNotifyRequest(stale);
+    assert.equal(cascade.matched, 0, 'stale snapshot must never advance a match');
 
     const matches = await reqMatches(req.id);
     assert.equal(matches.length, 0, 'no match rows may exist for a closed request');
@@ -244,7 +243,19 @@ describe('Phase 8 close-lifecycle hardening', () => {
   test('fulfil is idempotent: repeat fulfil on a fulfilled request converges with one event', async (t) => {
     if (!isFirebaseConfigured()) return t.skip('Store not configured');
     const req = await seedRequest({ requester_id: 'test-user-id', status: 'partially_matched', units_confirmed: 1 });
-    await seedMatch(req, `da_${tag()}`, 'approved', 1);
+    const approvedId = `da_${tag()}`;
+    const approvedMatchId = await seedMatch(req, approvedId, 'approved', 1);
+    // Fix 1: fulfilled requires a COMPLETED donation, not approval alone. Seed the
+    // request-keyed donation_log row so the request is truthfully 'fulfilled'.
+    await dbSaveDoc('donation_log', `donation_${approvedMatchId}`, {
+      id: `donation_${approvedMatchId}`,
+      donor_id: approvedId,
+      match_id: approvedMatchId,
+      request_id: req.id,
+      donation_date: nowISO().split('T')[0],
+      source: 'platform_match',
+      created_at: nowISO(),
+    });
 
     const first = await patch(`/api/requests/${req.tracking_code}/fulfill`);
     assert.equal(first.status, 200);
@@ -319,7 +330,7 @@ describe('Phase 8 close-lifecycle hardening', () => {
     const persisted = await live(req.id);
     const reRun = await matchAndNotifyRequest(persisted as BloodRequest);
     assert.equal(reRun.matched, 0, 'no new matches after the close');
-    assert.equal(await createNextDonorMatch(persisted as BloodRequest), null, 'no cascade after the close');
+    assert.equal((await matchAndNotifyRequest(persisted as BloodRequest)).matched, 0, 'no advance after the close');
   });
 
   // ── 7. CLEANUP FAILURE OBSERVABILITY + RECOVERY ────────────────────────────

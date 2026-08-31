@@ -33,7 +33,7 @@ interface DashboardResponse {
   donation_log: DonationLog[];
 }
 
-const REQUEST_LIVE = ['open', 'broadcasting', 'matching', 'partially_matched'];
+const REQUEST_LIVE = ['open', 'broadcasting', 'matching', 'partially_matched', 'secured', 'search_exhausted'];
 
 export function AdminConsole({ admin, onLogout }: AdminConsoleProps) {
   const { language } = useLanguage();

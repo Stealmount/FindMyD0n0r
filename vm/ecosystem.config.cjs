@@ -21,7 +21,7 @@ module.exports = {
       script: 'dist/admin-server.cjs',
       env: {
         NODE_ENV: 'production',
-        ADMIN_PORT: 6000,
+        ADMIN_PORT: 6001,
       },
       autorestart: true,
       max_restarts: 10,

@@ -139,8 +139,8 @@ test('ISSUE 1: eventual reconciliation converges stale post-claim projection wit
 
     const after = await dbGetDoc<{ status?: string; units_confirmed?: number; fulfilled_at?: string | null }>('blood_requests', req.id);
     assert.equal(after?.units_confirmed, 2, 'units_confirmed converged to authoritative approved count');
-    assert.equal(after?.status, 'fulfilled', 'fulfilled transition occurs when approved count reaches units_required');
-    assert.ok(after?.fulfilled_at, 'fulfilled_at correct');
+    assert.equal(after?.status, 'secured', '2/2 allocation converges to secured (NOT fulfilled — needs donations)');
+    assert.equal(after?.fulfilled_at ?? null, null, 'secured is not terminal');
 
     // No duplicate slot / no new capacity claim: matches and ledger untouched by reconcile.
     const approved = (await reqMatches(req.id)).filter((m) => m.donor_response === 'approved');
@@ -197,8 +197,8 @@ test('ISSUE 1b: multi-unit reconciliation drives transitions only at enough appr
     assert.equal(recMain.reconciled, 1);
     live = await dbGetDoc<{ status?: string; units_confirmed?: number; fulfilled_at?: string | null }>('blood_requests', req.id);
     assert.equal(live?.units_confirmed, 3, 'converged to authoritative 3');
-    assert.equal(live?.status, 'fulfilled', 'transition only when enough units approved');
-    assert.ok(live?.fulfilled_at);
+    assert.equal(live?.status, 'secured', '3/3 allocation converges to secured (NOT fulfilled — needs donations)');
+    assert.equal(live?.fulfilled_at ?? null, null, 'secured is not terminal');
 
     const approved = (await reqMatches(req.id)).filter((m) => m.donor_response === 'approved');
     assert.deepEqual([...approved].map((m) => m.unit_slot).sort((a: any, b: any) => a - b), [1, 2, 3], 'unique slots across all units');

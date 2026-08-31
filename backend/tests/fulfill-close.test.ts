@@ -30,7 +30,7 @@ import { spawn, ChildProcess } from 'node:child_process';
 import { saveDoc as dbSaveDoc, getDoc as dbGetDoc, getCollection as dbGetCollection, isFirebaseConfigured } from '../src/lib/serverDb';
 import { saveDoc as storeSaveDoc } from '../src/lib/store';
 import { cacheGet, cacheSetNX } from '../src/lib/redisCache';
-import { matchAndNotifyRequest, createNextDonorMatch } from '../services/matchingEngine';
+import { matchAndNotifyRequest } from '../services/matchingEngine';
 import { nowISO } from '../helpers/time';
 import type { BloodRequest } from '../src/types';
 
@@ -197,8 +197,19 @@ describe('Requester "Mark Fulfilled" close lifecycle (/api/requests/:code/fulfil
     if (!isFirebaseConfigured()) return t.skip('Store not configured');
     const req = await seedRequest({ requester_id: 'test-user-id', units_required: 1, status: 'partially_matched', units_confirmed: 1 });
     const approvedId = `da_${tag()}`;
-    await seedMatch(req, approvedId, 'approved', 1);
+    const approvedMatchId = await seedMatch(req, approvedId, 'approved', 1);
     await seedMatch(req, `dp_${tag()}`, 'pending');
+    // Fix 1: fulfilled requires a COMPLETED donation, not approval alone. Seed the
+    // request-keyed donation_log row so the request can legitimately reach 'fulfilled'.
+    await dbSaveDoc('donation_log', `donation_${approvedMatchId}`, {
+      id: `donation_${approvedMatchId}`,
+      donor_id: approvedId,
+      match_id: approvedMatchId,
+      request_id: req.id,
+      donation_date: nowISO().split('T')[0],
+      source: 'platform_match',
+      created_at: nowISO(),
+    });
 
     const closed = await fulfillViaHttp(req.tracking_code);
     assert.equal(closed.status, 200);
@@ -237,8 +248,7 @@ describe('Requester "Mark Fulfilled" close lifecycle (/api/requests/:code/fulfil
     const persisted = await dbGetDoc<BloodRequest>('blood_requests', req.id);
     const reRun = await matchAndNotifyRequest(persisted as BloodRequest);
     assert.equal(reRun.matched, 0);
-    const next = await createNextDonorMatch(persisted as BloodRequest);
-    assert.equal(next, null, 'cascade match for a closed request must be refused');
+    assert.equal((await matchAndNotifyRequest(persisted as BloodRequest)).matched, 0, 'advance for a closed request must be refused');
 
     // Requester dashboard reflects the terminal state (revalidation source).
     const dash = await (await fetch(`${BASE}/api/requester/requests`, { headers: AUTH })).json() as { requests: Array<{ id: string; status: string; units_confirmed: number }> };

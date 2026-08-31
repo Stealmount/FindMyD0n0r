@@ -36,7 +36,7 @@ import { getUpstash, k } from '../src/lib/upstash';
 import { approveMatchById } from '../routes/matching';
 import { claimUnitSlot, computeApprovedSlots } from '../helpers/capacityClaim';
 import { reconcileRequestLifecycle } from '../helpers/requestLifecycle';
-import { matchAndNotifyRequest, createNextDonorMatch, TERMINAL_REQUEST_STATUSES } from '../services/matchingEngine';
+import { matchAndNotifyRequest, TERMINAL_REQUEST_STATUSES } from '../services/matchingEngine';
 import { nowISO } from '../helpers/time';
 import type { BloodRequest } from '../src/types';
 
@@ -217,8 +217,8 @@ test('CLAIM SUCCESS + DB FAILURE → retry converges to one coherent approved re
 
     request = await dbGetDoc<{ units_confirmed?: number; status?: string; fulfilled_at?: string | null }>('blood_requests', req.id);
     assert.equal(request?.units_confirmed, 2, 'projection converged to the authoritative allocation on retry');
-    assert.equal(request?.status, 'fulfilled');
-    assert.ok(request?.fulfilled_at, 'fulfilled_at stamped on convergence');
+    assert.equal(request?.status, 'secured', '2/2 allocation is secured, NOT fulfilled (needs donations)');
+    assert.equal(request?.fulfilled_at ?? null, null, 'secured is not terminal');
 
     const all = await reqMatches(req.id);
     const approved = all.filter((m) => m.donor_response === 'approved');
@@ -264,8 +264,8 @@ test('CLAIM + PROCESS/RESTART RECOVERY → reconcile reconstructs state, no dupl
     assert.equal(rec.changed, true, 'recovery closed the projection gap');
     request = await dbGetDoc<{ units_confirmed?: number; status?: string; fulfilled_at?: string | null }>('blood_requests', req.id);
     assert.equal(request?.units_confirmed, 1);
-    assert.equal(request?.status, 'fulfilled');
-    assert.ok(request?.fulfilled_at);
+    assert.equal(request?.status, 'secured', '1/1 allocation is secured, NOT fulfilled (needs donations)');
+    assert.equal(request?.fulfilled_at ?? null, null, 'secured is not terminal');
 
     // Second recovery run is a no-op (idempotent).
     const rec2 = await reconcileRequestLifecycle(req.id, 1);
@@ -317,7 +317,7 @@ test('DUPLICATE + CONCURRENT approval retries after partial failure converge ide
 
     request = await dbGetDoc<{ units_confirmed?: number; status?: string }>('blood_requests', req.id);
     assert.equal(request?.units_confirmed, 2, 'converged on retry');
-    assert.equal(request?.status, 'fulfilled');
+    assert.equal(request?.status, 'secured', '2/2 allocation is secured, NOT fulfilled (needs donations)');
     const approved = (await reqMatches(req.id)).filter((m) => m.donor_response === 'approved');
     assert.equal(approved.length, 2, 'exactly two approved contributions, not three');
     assert.deepEqual([...approved].map((m) => m.unit_slot).sort((a, b) => a - b), [1, 2]);
@@ -357,8 +357,8 @@ test('TERMINAL DURING NOTIFICATION WINDOW → unsent invites suppressed and roll
 
     // No new donor match can be created for the now-terminal request.
     process.env.TEST_NOTIFY_CLOSE = '';
-    const cascade = await createNextDonorMatch((await dbGetDoc<BloodRequest>('blood_requests', req.id)) as BloodRequest);
-    assert.equal(cascade, null, 'no new match for a terminal request');
+    const cascade = await matchAndNotifyRequest((await dbGetDoc<BloodRequest>('blood_requests', req.id)) as BloodRequest);
+    assert.equal(cascade.matched, 0, 'no new match for a terminal request');
 
     // Approval path is also dead for the terminal request.
     const dOther = `dOther_${tag()}`;

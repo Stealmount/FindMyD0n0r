@@ -70,9 +70,9 @@ export type AccountStatus = 'active' | 'cooldown' | 'inactive' | 'banned' | 'del
 
 export type UrgencyLevel = 'critical' | 'urgent' | 'planned';
 
-export type RequestStatus = 'draft' | 'open' | 'broadcasting' | 'matching' | 'partially_matched' | 'fulfilled' | 'expired' | 'cancelled';
+export type RequestStatus = 'draft' | 'open' | 'broadcasting' | 'matching' | 'partially_matched' | 'secured' | 'search_exhausted' | 'fulfilled' | 'expired' | 'cancelled';
 
-export type MatchStatus = 'pending' | 'approved' | 'declined' | 'timed_out';
+export type MatchStatus = 'pending' | 'approved' | 'declined' | 'timed_out' | 'expired';
 
 export type MatchOutcome = 'donated' | 'not_donated' | null;
 
@@ -84,9 +84,11 @@ export type NotificationStatus = 'queued' | 'sent' | 'delivered' | 'read' | 'fai
 
 // ─── Progressive matching tuning (single source of truth) ──────────────────────
 export const MAX_UNITS_PER_REQUEST = 5;   // hard cap on units_required
-export const INITIAL_BATCH_SIZE = 8;      // donors pinged per search round
+export const INITIAL_BATCH_SIZE = 8;      // (legacy) donors pinged per old search round
 export const ELIGIBLE_POOL_SIZE = 100;    // ranked candidate pool cap
-export const MAX_SEARCH_BATCHES = 5;      // rounds before giving up
+export const MAX_SEARCH_BATCHES = 5;      // (legacy) old rounds cap — retired in favor of MAX_DONOR_BUDGET
+export const MAX_DONOR_BUDGET = 15;       // hard cap on unique donors invited per request (5 → 5 → 5)
+export const INVITATION_TIMEOUT_MINUTES = 5; // donor response window before a pending invite expires
 
 export interface User {
   id: string; // doc ID
@@ -98,6 +100,7 @@ export interface User {
   donation_frequency: DonationFrequency;
   last_donation_date: string | null; // YYYY-MM-DD
   cooldown_until: string | null; // YYYY-MM-DD
+  cooldown_days?: 60 | 90 | 120; // donor-selectable cooldown period; default 90 when absent
   pincode: string; // 6-digit numeric
   area: string;
   city: string;
@@ -160,6 +163,7 @@ export interface DonorProfile {
   state: string | null;
   last_donation_date: string | null;
   cooldown_until: string | null;
+  cooldown_days?: 60 | 90 | 120;
   health_self_declaration: boolean;
   profile_complete: boolean;
   is_available: boolean;
@@ -217,13 +221,13 @@ export interface BloodRequest {
   created_at: string; // ISO String
   requester_id?: string; // Pointing to logged-in requester UID
   showcase_opt_in?: boolean; // Public feed uses a sanitized projection only
-  broadcast_to_simulator?: boolean; // Requester opt-in to broadcast alert to Live Simulator
   patient_age?: number;
   patient_gender?: 'Male' | 'Female' | 'Other';
   component_needed?: 'Whole Blood (WB)' | 'Packed Red Blood Cells (PRBC)' | 'Single Donor Platelets (SDP)' | 'Random Donor Platelets (RDP)' | 'Fresh Frozen Plasma (FFP)' | 'Cryoprecipitate';
   hospital_uhid?: string; // UHID / IPD / Ward No
   attending_doctor?: string; // Dr. Name
   units_confirmed?: number; // How many donors said YES (0 to units_required)
+  units_completed?: number; // How many units actually donated (from donation_log)
   requester_email_verified?: boolean; // Email verified (OTP or Gmail fast-track)
   search_batch?: number; // Current progressive-search round (1-based)
 }

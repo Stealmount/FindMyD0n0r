@@ -14,9 +14,10 @@ import rateLimitMiddleware from "../middleware/rateLimiter";
 import { validate } from "../validation";
 import { respondPublicSchema } from "../validation/matching";
 import { normalizePhone } from "../helpers/phone";
-import { nowISO, daysFromNow } from "../helpers/time";
+import { nowISO, computeCooldownUntil, resolveCooldownDays } from "../helpers/time";
 import { reconcileRequestLifecycle } from "../helpers/requestLifecycle";
 import { claimUnitSlot, computeApprovedSlots } from "../helpers/capacityClaim";
+import { recordDonationCompletion, recordDonationNotCompleted } from "../helpers/completionProvider";
 import {
   sendWhatsApp,
   sendDonorWhatsApp,
@@ -30,12 +31,12 @@ import { buildRequesterConfirmEmailHTML, buildDonorConfirmedDetailsEmailHTML } f
 import { sendEmailViaResend } from "../services/notificationService";
 import {
   releaseDonorLock,
-  createNextDonorMatch,
   matchAndNotifyRequest,
-  findEligibleDonors,
   TERMINAL_REQUEST_STATUSES,
+  declineMatchIfPending,
 } from "../services/matchingEngine";
 import { sendErrorResponse, UnauthorizedError, NotFoundError, ForbiddenError, AppError } from "../helpers/errors";
+import { checkRequesterAuth } from "./tracking";
 import type { BloodRequest, Match, User } from "../src/types";
 
 const router = Router();
@@ -183,11 +184,9 @@ export async function declineMatchById(
 ): Promise<{ ok: boolean; error?: string; status?: number }> {
   const match = await dbGetDoc<Match>("matches", matchId);
   if (!match) return { ok: false, error: "Match not found", status: 404 };
-  await dbSaveDoc("matches", matchId, {
-    ...match,
-    donor_response: "declined",
-    donor_response_at: timestamp || nowISO(),
-  });
+  // C-2: atomic pending→declined — never overwrite a concurrent approval/expiry.
+  const declined = await declineMatchIfPending(matchId, timestamp || nowISO());
+  if (!declined) return { ok: false, error: "Already resolved", status: 409 };
   await releaseDonorLock(match.donor_id, match.request_id);
   await cacheInvalidatePrefix("match_status_");
   await cacheInvalidatePrefix("pending_matches_");
@@ -324,6 +323,16 @@ router.post("/api/matches/:matchId/timeout", wrap(async (req, res) => {
   if (!match) return sendErrorResponse(res, new NotFoundError("Match not found"));
   const isAdmin = (authUser as any).role === "admin" || authUser.id === "admin-id";
   if (!isAdmin && match.donor_id !== authUser.id && match.donor_id !== profileId) return sendErrorResponse(res, new ForbiddenError("Not authorized"));
+  // Only a still-pending invite may be timed out. An accepted (approved)
+  // donor must never be downgraded to timed_out by a stray/late timeout call —
+  // mirror the sweep worker's atomic pending-only expiry rule (D4).
+  if (match.donor_response !== "pending") {
+    return sendErrorResponse(res, new AppError(
+      "Only pending matches can be timed out.",
+      409,
+      "MATCH_NOT_PENDING"
+    ));
+  }
   await dbSaveDoc("matches", req.params.matchId, {
     ...match,
     donor_response: "timed_out",
@@ -347,34 +356,19 @@ router.post("/api/matches/:matchId/confirm-donation", wrap(async (req, res) => {
   if (!isAdmin && match.donor_id !== authUser.id && match.donor_id !== profileId) return sendErrorResponse(res, new ForbiddenError("Not authorized"));
 
   const confirmedAt  = req.body?.confirmedAt || nowISO();
-  const donationDate = confirmedAt.split("T")[0];
-  const cooldownEnd  = daysFromNow(90);
   const request = await dbGetDoc<BloodRequest>("blood_requests", match.request_id);
 
-  await Promise.all([
-    dbSaveDoc("matches", req.params.matchId, {
-      ...match,
-      outcome: "donated",
-      outcome_confirmed_at: confirmedAt,
-    }),
-    dbSaveDoc("donation_log", `donation_${req.params.matchId}`, {
-      id:            `donation_${req.params.matchId}`,
-      donor_id:      donor.id,
-      match_id:      match.id,
-      request_id:    match.request_id,
-      donation_date: donationDate,
-      source:        "platform_match",
-      notes:         "Confirmed via platform",
-      created_at:    nowISO(),
-    }),
-    dbSaveDoc("users", donor.id, {
-      ...donor,
-      cooldown_until: cooldownEnd,
-      account_status: "cooldown",
-      updated_at:     nowISO(),
-    }),
-  ]);
+  // Single provider: outcome + donation_log + cooldown + derived units_completed.
+  await recordDonationCompletion({
+    matchId: match.id,
+    requestId: match.request_id,
+    donor,
+    confirmedAt,
+  });
 
+  const donationDate = confirmedAt.split("T")[0];
+  // Tell the donor the cooldown period matching their selection (60/90/120).
+  const cooldownEnd = computeCooldownUntil(donationDate, resolveCooldownDays(donor));
   await sendDonorWhatsApp(
     donor,
     // ponytail fix: was passing match.request_id (internal UUID) where the
@@ -386,11 +380,6 @@ router.post("/api/matches/:matchId/confirm-donation", wrap(async (req, res) => {
     buildDonorReferralMessage(donor.full_name)
   );
 
-  await cacheInvalidatePrefix("match_status_");
-  await cacheInvalidatePrefix("pending_matches_");
-  await cacheInvalidatePrefix("req_status_");
-  await cacheInvalidatePrefix("eligible_");
-
   return res.json({ success: true });
 }));
 
@@ -400,24 +389,33 @@ router.post("/api/matches/:matchId/donation-not-completed", wrap(async (req, res
   if (!authUser) return sendErrorResponse(res, new UnauthorizedError("Authentication required"));
   const match = await dbGetDoc<Match>("matches", req.params.matchId);
   if (!match) return sendErrorResponse(res, new NotFoundError("Match not found"));
-  await dbSaveDoc("matches", req.params.matchId, {
-    ...match,
-    outcome: "not_donated",
-    outcome_confirmed_at: nowISO(),
-  });
-  await cacheInvalidatePrefix("match_status_");
-  await cacheInvalidatePrefix("pending_matches_");
+  // C-9: same owner/admin rule as confirm-donation — only the match's donor (or
+  // their linked profile, or an admin) may record that a donation did not happen.
+  const linked = await getLinkedProfile(authUser.id);
+  const profileId = linked?.profile?.id || authUser.id;
+  const isAdmin = (authUser as any).role === "admin" || authUser.id === "admin-id";
+  if (!isAdmin && match.donor_id !== authUser.id && match.donor_id !== profileId) return sendErrorResponse(res, new ForbiddenError("Not authorized"));
+  await recordDonationNotCompleted({ matchId: match.id, requestId: match.request_id });
   return res.json({ success: true });
 }));
 
 // ─── POST /api/requests/:requestId/next-donor ────────────────────────────────
+// Reconcile/advance trigger ONLY. It invokes the single owner (matchAndNotifyRequest)
+// which alone applies the budget, pending-invite, capacity, dedup and eligibility
+// gates. It selects no donor, starts no invitation directly, and never bypasses
+// the authoritative matching flow (per plan D1/P3).
 router.post("/api/requests/:requestId/next-donor", wrap(async (req, res) => {
   const authUser = await getAuthenticatedUser(req);
   if (!authUser) return sendErrorResponse(res, new UnauthorizedError("Authentication required"));
   const request = await dbGetDoc<BloodRequest>("blood_requests", req.params.requestId);
   if (!request) return sendErrorResponse(res, new NotFoundError("Request not found"));
-  const result = await createNextDonorMatch(request, req.body?.declinedMatchId || req.body?.timedOutMatchId);
-  return res.json({ success: !!result, match: result || null });
+  // C-9: only the request owner (requester identity chain) or an admin may fire
+  // the advance trigger. It never bypasses sequencing — it only invokes the single
+  // owner, which alone applies the budget/pending/capacity/dedup/eligibility gates.
+  const isAdmin = (authUser as any).role === "admin" || authUser.id === "admin-id";
+  if (!isAdmin && !(await checkRequesterAuth(req, request))) return sendErrorResponse(res, new ForbiddenError("Unauthorized"));
+  const result = await matchAndNotifyRequest(request);
+  return res.json({ success: result.matched > 0, matched: result.matched });
 }));
 
 export default router;

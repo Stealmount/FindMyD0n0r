@@ -23,12 +23,12 @@ import {
 import { buildDonorSosEmailHTML, buildDonorConfirmedDetailsEmailHTML, buildDonorsMatchedEmailHTML, buildNoDonorsYetEmailHTML } from "../src/lib/email";
 import { sendEmailViaResend } from "./notificationService";
 import { enqueueMessage } from "../src/lib/messaging";
+import { reconcileRequestLifecycle } from "../helpers/requestLifecycle";
 import {
   isBloodCompatible,
   BLOOD_COMPATIBILITY_MATRIX,
-  INITIAL_BATCH_SIZE,
-  ELIGIBLE_POOL_SIZE,
-  MAX_SEARCH_BATCHES,
+  MAX_DONOR_BUDGET,
+  INVITATION_TIMEOUT_MINUTES,
   type BloodType,
 } from "../src/types";
 import type { BloodRequest, DonationLog, Match, NotificationLog, User } from "../src/types";
@@ -37,15 +37,28 @@ import { getDistanceBetweenPincodes } from "../src/lib/geo";
 import { PINCODE_COORDS } from "../src/data/pincode_coords";
 import { log } from "../helpers/logger";
 
-// ─── Shared Constants ────────────────────────────────────────────────────────
-// ponytail: single source of truth — worker was filtering only ["open","matching"],
-// missing "broadcasting" and "partially_matched" entirely (P0 bug)
-export const ACTIVE_REQUEST_STATUSES: readonly string[] = ["broadcasting", "matching", "open", "partially_matched"];
-
-// Phase 3: consent on one terminal set. `closed` is included temporarily so
-// legacy rows written before the sweepWorker 'closed'→'expired' switch stay
-// terminal — remove after backfill-closed-to-expired has run in production.
-export const TERMINAL_REQUEST_STATUSES: readonly string[] = ["cancelled", "fulfilled", "expired", "closed"];
+// Status sets + donor search-budget live in helpers/searchBudget.ts (extracted
+// to break the matchingEngine <-> requestLifecycle import cycle). Imported for
+// local use and re-exported so every existing `from "../services/matchingEngine"`
+// consumer (routes, worker, sweep scripts, tests) keeps working unchanged.
+import {
+  ACTIVE_REQUEST_STATUSES,
+  TERMINAL_REQUEST_STATUSES,
+  readSearchBudget,
+  spendDonorBudget,
+  resetSearchBudget,
+  searchTriedKey,
+  searchBudgetKey,
+} from "../helpers/searchBudget";
+export {
+  ACTIVE_REQUEST_STATUSES,
+  TERMINAL_REQUEST_STATUSES,
+  readSearchBudget,
+  spendDonorBudget,
+  resetSearchBudget,
+  searchTriedKey,
+  searchBudgetKey,
+};
 
 export const DONOR_LOCK_TTL_S = 5 * 60; // 5 minutes
 
@@ -248,6 +261,116 @@ export async function releaseDonorLock(donorId: string, requestId: string): Prom
   await cacheDel(key);
 }
 
+// ─── Atomic match-state transition (C-1/C-2) ─────────────────────────────────
+// A stale caller snapshot (sweep worker, WAHA webhook) must never overwrite a
+// concurrent approval/expiry with a raw full-doc write. This transition re-reads
+// the LIVE match inside Redis and only flips it when it is still in the expected
+// `from` state — mirroring how the capacity claim guards the approve direction.
+// The JS fallback keeps the same "never overwrite a non-expected state" guard.
+const MATCH_TRANSITION_SCRIPT = `
+local matchRaw = redis.call('GET', KEYS[1])
+if not matchRaw then return 0 end
+local m = cjson.decode(matchRaw)
+if m.donor_response ~= ARGV[1] then return 0 end
+m.donor_response = ARGV[2]
+m.donor_response_at = ARGV[3]
+redis.call('SET', KEYS[1], cjson.encode(m))
+return 1
+`;
+
+async function transitionMatchStateIf(
+  matchId: string,
+  from: string,
+  to: string,
+  timestamp: string
+): Promise<boolean> {
+  if (isUpstashConfigured()) {
+    try {
+      const res = (await getUpstash().eval(
+        MATCH_TRANSITION_SCRIPT,
+        [k(`matches:${matchId}`)],
+        [from, to, timestamp]
+      )) as unknown;
+      return Number(Array.isArray(res) ? res[0] : res) === 1;
+    } catch (e: any) {
+      log.warn("transitionMatchStateIf Lua failed — guarded JS fallback", {
+        matchId,
+        from,
+        to,
+        err: e?.message,
+      });
+    }
+  }
+  try {
+    const live = await dbGetDoc<Match>("matches", matchId);
+    if (!live || live.donor_response !== from) return false;
+    await dbSaveDoc("matches", matchId, {
+      ...live,
+      donor_response: to,
+      donor_response_at: timestamp,
+    } as unknown as Record<string, unknown>);
+    return true;
+  } catch (e: any) {
+    log.warn("transitionMatchStateIf guarded save failed", { matchId, from, to, err: e?.message });
+    return false;
+  }
+}
+
+/** Idempotent: transitions a match pending → expired only if still pending. */
+export async function expireMatchIfPending(
+  matchId: string,
+  timestamp?: string
+): Promise<boolean> {
+  return transitionMatchStateIf(matchId, "pending", "expired", timestamp || nowISO());
+}
+
+/** Idempotent: transitions a match pending → declined only if still pending. */
+export async function declineMatchIfPending(
+  matchId: string,
+  timestamp?: string
+): Promise<boolean> {
+  return transitionMatchStateIf(matchId, "pending", "declined", timestamp || nowISO());
+}
+
+/**
+ * Shared hard-filter predicate — one source of truth for BOTH candidate
+ * acquisition paths (index-backed donor_profiles and full-scan users).
+ * Mirrors matching.ts isDonorEligible semantics; guards are explicit-false
+ * so shapes that omit a field (mapProfile output) are not spuriously
+ * excluded but an explicitly-false value always is.
+ */
+export function isDonorEligibleForRequest(
+  d: User,
+  request: BloodRequest,
+  ctx: { today: string; recentAlertedDonors: Set<string> }
+): boolean {
+  if (d.account_status !== "active") return false;
+  if (d.availability_status === "unavailable") return false;
+  if (d.whatsapp_verified === false) return false;
+  if (d.profile_complete === false) return false;
+  if (d.is_available === false) return false;
+  if (d.cooldown_until && d.cooldown_until >= ctx.today) return false;
+
+  // Anti-spam throttle: prevent rapid-fire repeated texts across requests
+  if (ctx.recentAlertedDonors.has(d.id) && request.urgency_level !== "critical") return false;
+
+  // Blood compatibility: use the full ABO/Rh matrix, NOT exact-only.
+  if (request.blood_type_needed !== 'ANY') {
+    const donorType = (d.blood_type || '').toUpperCase().trim() as BloodType;
+    if (!isBloodCompatible(donorType, request.blood_type_needed as BloodType)) return false;
+  }
+
+  // Self-match prevention.
+  // normalizePhone(null|undefined) → "" (see helpers/phone.ts: String(phone || "")),
+  // which will never equal a valid requester phone (91XXXXXXXXXX format).
+  // Donors with phone=null are therefore NOT excluded from matching by this guard.
+  if (normalizePhone(d.phone) === normalizePhone(request.requester_phone)) return false;
+  if (d.whatsapp_number && normalizePhone(d.whatsapp_number) === normalizePhone(request.requester_phone)) return false;
+  if (d.email && request.requester_email && d.email.toLowerCase().trim() === request.requester_email.toLowerCase().trim()) return false;
+
+  return true;
+}
+
 /**
  * Returns eligible donors for a request, ordered by proximity.
  * Results are Redis-cached for 60 s to keep lookups fast.
@@ -265,9 +388,12 @@ export async function findEligibleDonors(
   if (cached) return cached;
 
   // Prefer index-backed candidate fetch (narrows the set in the store) with
-  // the full-table scan as automatic fallback.
+  // the full-table scan as automatic fallback. An EMPTY index result is NOT
+  // authoritative — the pincode-prefix neighborhood may simply have no indexed
+  // donors while eligible donors exist elsewhere. Only a non-empty index
+  // snapshot short-circuits the full scan.
   const dbCandidates = await findEligibleDonorsFromDB(request);
-  const allDonors = dbCandidates !== null
+  const allDonors = dbCandidates && dbCandidates.length > 0
     ? dbCandidates
     : await dbGetCollection<User>('users');
   const allMatches = await dbGetCollection<Match>('matches');
@@ -282,33 +408,9 @@ export async function findEligibleDonors(
   );
 
   // ── Hard filters ────────────────────────────────────────────────────────
-  const eligible = allDonors.filter((d) => {
-    if (d.account_status !== "active") return false;
-    if (d.availability_status === "unavailable") return false;
-    if (d.cooldown_until && d.cooldown_until >= today) return false;
-
-    // Anti-spam throttle: prevent rapid-fire repeated texts across requests
-    if (recentAlertedDonors.has(d.id) && request.urgency_level !== "critical") return false;
-
-    // Blood compatibility: use the full ABO/Rh matrix, NOT exact-only.
-    if (request.blood_type_needed !== 'ANY') {
-      const donorType = (d.blood_type || '').toUpperCase().trim() as BloodType;
-      if (!isBloodCompatible(donorType, request.blood_type_needed as BloodType)) return false;
-    }
-
-    // Emergency-only restriction removed: all requests match available donors
-    // if (d.emergency_only && request.urgency_level !== "critical") return false;
-
-    // Self-match prevention.
-    // normalizePhone(null|undefined) → "" (see helpers/phone.ts: String(phone || "")),
-    // which will never equal a valid requester phone (91XXXXXXXXXX format).
-    // Donors with phone=null are therefore NOT excluded from matching by this guard.
-    if (normalizePhone(d.phone) === normalizePhone(request.requester_phone)) return false;
-    if (d.whatsapp_number && normalizePhone(d.whatsapp_number) === normalizePhone(request.requester_phone)) return false;
-    if (d.email && request.requester_email && d.email.toLowerCase().trim() === request.requester_email.toLowerCase().trim()) return false;
-
-    return true;
-  });
+  const eligible = allDonors.filter((d) =>
+    isDonorEligibleForRequest(d, request, { today, recentAlertedDonors })
+  );
 
   // ── Tag exact vs compatible ─────────────────────────────────────────────
   const donorsWithDistance = eligible.map((d) => {
@@ -380,8 +482,8 @@ export async function findEligibleDonors(
  *
  * Returns a flat candidate list mapped to the same User shape mapProfile()
  * produces; findEligibleDonors applies the remaining filters + 4-tier geo
- * ranking. Returns null when the index path is unavailable so callers fall back to
- * the full scan.
+ * ranking. Returns null when the index path yields no candidates or is
+ * unavailable — callers fall back to the full scan.
  */
 export async function findEligibleDonorsFromDB(
   request: BloodRequest
@@ -429,7 +531,7 @@ export async function findEligibleDonorsFromDB(
       donorProfiles.push(...filtered.slice(0, 200));
     }
 
-    if (donorProfiles.length === 0) return [];
+    if (donorProfiles.length === 0) return null;
 
     // Fetch corresponding profiles from the profiles collection
     const profileIds = [...new Set(donorProfiles.map((dp: any) => dp.profile_id).filter(Boolean))];
@@ -709,14 +811,23 @@ export async function matchAndNotifyRequest(request: BloodRequest) {
   // Phase 5: trust the server-side counter once it exists; fall back to live count.
   const unitsConfirmed = request.units_confirmed ?? approvedCount;
   const openSlots = Math.max(0, request.units_required - Math.max(unitsConfirmed, approvedCount));
-  // Progressive batching gate: wait out every pending invite before spawning the
-  // next round; hard-stop when fulfilled or MAX_SEARCH_BATCHES reached (Phase 2).
-  const hasPendingInvites = requestMatches.some((m) => m.donor_response === "pending");
-  if (hasPendingInvites || openSlots === 0) return { matched: 0, deliveries: [] };
-  const batch = (request.search_batch ?? 0) + 1;
-  if (batch > MAX_SEARCH_BATCHES) return { matched: 0, deliveries: [] };
 
-  // Filter out already-offered AND currently-locked donors
+  // Sequential single-invitation owner (windows 5 → 5 → 5, max 15 unique donors).
+  // Gate 1: budget cap — never invite donor #16 (atomic read of the tried-set).
+  const budget = await readSearchBudget(request.id);
+  if (budget >= MAX_DONOR_BUDGET) {
+    // Re-derive the derived status: budget exhausted + under-allocation →
+    // `search_exhausted` (NOT terminal). Reconcile is idempotent + cheap.
+    await reconcileRequestLifecycle(request.id, request.units_required || 1);
+    return { matched: 0, deliveries: [] };
+  }
+  // Gate 2: one invitation at a time — wait out every pending invite.
+  const hasPendingInvites = requestMatches.some((m) => m.donor_response === "pending");
+  if (hasPendingInvites) return { matched: 0, deliveries: [] };
+  // Gate 3: no capacity left.
+  if (openSlots === 0) return { matched: 0, deliveries: [] };
+
+  // Pick the single next donor: first eligible, never-offered, not lock-busy.
   const lockChecks = await Promise.all(
     eligibleDonors
       .filter((d) => !alreadyOffered.has(d.id))
@@ -732,84 +843,84 @@ export async function matchAndNotifyRequest(request: BloodRequest) {
     match_rank: number;
     is_exact_match: boolean;
   })[];
+  const nextDonor = freeDonors[0];
 
-  // Race model: intentionally over-invite up to INITIAL_BATCH_SIZE nearest free
-  // donors per round — fastest responders claim slots (user-approved tradeoff).
-  const selectedDonors = freeDonors.slice(0, ELIGIBLE_POOL_SIZE).slice(0, INITIAL_BATCH_SIZE);
-
-  // Phase 4 observability: progressive multi-unit rounds are audit-able from
-  // logs — confirmed counter, open slots, next round, and this wave's size.
-  if (request.units_required > 1) {
-    console.log(`[Matching] ${request.tracking_code} — confirmed ${request.units_confirmed ?? approvedCount}/${request.units_required}, openSlots ${openSlots}, batch ${request.search_batch ?? 0}→${batch}, hasPending ${hasPendingInvites}, selected ${selectedDonors.length}`);
+  let inserts: { match: Match; donor: User }[] = [];
+  if (nextDonor) {
+    const locked = await acquireDonorLock(nextDonor.id, request.id);
+    if (locked) {
+      // Atomic spend BEFORE the match row so the 15-cap holds across every caller
+      // of this owner. A "already spent" (rare cross-path race) skips this donor.
+      const spent = await spendDonorBudget(request.id, nextDonor.id);
+      if (spent) {
+        inserts = [
+          {
+            match: {
+              id: randomUUID(),
+              request_id: request.id,
+              donor_id: nextDonor.id,
+              match_rank: nextDonor.match_rank,
+              notification_channel: "whatsapp",
+              notification_sent_at: null,
+              reminder_sent_at: null,
+              donor_response: "pending",
+              donor_response_at: null,
+              contact_shared_at: null,
+              outcome: null,
+              outcome_confirmed_at: null,
+              created_at: nowISO(),
+              distance_km: nextDonor.distance_km,
+              is_exact_match: nextDonor.is_exact_match,
+              public_token: randomBytes(16).toString("hex"),
+              notification_status: "pending",
+              search_batch: request.search_batch ?? 1,
+            },
+            donor: nextDonor,
+          },
+        ];
+      } else {
+        await releaseDonorLock(nextDonor.id, request.id);
+      }
+    }
+    if (inserts.length > 0) {
+      console.log(`[Matching] ${request.tracking_code} — budget ${budget}/${MAX_DONOR_BUDGET}, openSlots ${openSlots}, inviting donor ${nextDonor.id}`);
+    }
   }
 
-  // Acquire locks for selected donors before writing match records
-  const lockResults = await Promise.all(
-    selectedDonors.map((d) => acquireDonorLock(d.id, request.id))
-  );
-  const lockedDonors = selectedDonors.filter((_, i) => lockResults[i]);
+  // Persist the single invitation; the atomic transition refuses terminal/absent
+  // requests. Per D1/D2 the spent budget is NOT refunded on a rolled-back invite
+  // (the request is terminal; reopen wipes the budget). We do release the donor lock.
+  if (inserts.length > 0) {
+    // Earliest possible persist: the delivery guard re-reads the live match row,
+    // so it must exist before the notify fan-out.
+    await Promise.all(
+      inserts.map(({ match }) =>
+        dbSaveDoc("matches", match.id, match as unknown as Record<string, unknown>)
+      )
+    );
+    const bumped = await transitionRequestStatusIfActive(request.id, "matching", {});
+    if (!bumped) {
+      log.warn("Match round save refused — request closed concurrently; rolling back new match", {
+        requestId: request.id,
+        trackingCode: request.tracking_code,
+        newMatches: inserts.length,
+      });
+      await rollbackJustCreatedMatches(request.id, inserts.map((i) => i.match));
+      await releaseDonorLock(inserts[0].donor.id, request.id);
+      return { matched: 0, deliveries: [] as PromiseSettledResult<unknown>[] };
+    }
 
-  const inserts = await Promise.all(
-    lockedDonors.map(async (donor) => {
-      const match: Match = {
-        id: randomUUID(),
-        request_id: request.id,
-        donor_id: donor.id,
-        match_rank: donor.match_rank,
-        notification_channel: "whatsapp",
-        notification_sent_at: null,
-        reminder_sent_at: null,
-        donor_response: "pending",
-        donor_response_at: null,
-        contact_shared_at: null,
-        outcome: null,
-        outcome_confirmed_at: null,
-        created_at: nowISO(),
-        distance_km: donor.distance_km,
-        is_exact_match: donor.is_exact_match,
-        public_token: randomBytes(16).toString("hex"),
-        notification_status: "pending",
-        search_batch: batch,
-      };
-      await dbSaveDoc("matches", match.id, match as unknown as Record<string, unknown>);
-      return { match, donor };
-    })
-  );
-
-  // Phase 8 hardening: persist the batch advance ATOMICALLY against the LIVE
-  // document. A plain full-doc overwrite of the (now-live, but seconds-old)
-  // snapshot could clobber a concurrent close back into 'matching'/'open' and
-  // resurrect the search; the Lua conditional refuses terminal/absent
-  // documents. On refusal, the rows just created are rolled back — a closed
-  // request must never gain matches, locks, or notifications.
-  const bumped = await transitionRequestStatusIfActive(
-    request.id,
-    inserts.length ? "matching" : "open",
-    { search_batch: batch }
-  );
-  if (!bumped) {
-    log.warn("Match round save refused — request closed concurrently; rolling back new matches", {
-      requestId: request.id,
-      trackingCode: request.tracking_code,
-      batch,
-      newMatches: inserts.length,
-    });
-    await rollbackJustCreatedMatches(request.id, inserts.map((i) => i.match));
-    return { matched: 0, deliveries: [] as PromiseSettledResult<unknown>[] };
-  }
-
-  // Final safety gate before any notification fan-out: confirms the request is
-  // still live. The authoritative invariants (match rows + locks + status) are
-  // already closed by the atomic steps above; this narrows the notification
-  // window so a close that lands a moment later does not fan out donor invites.
-  const preNotify = await dbGetDoc<BloodRequest>("blood_requests", request.id);
-  if (!preNotify || TERMINAL_REQUEST_STATUSES.includes(preNotify.status)) {
-    log.warn("Notify gate refused — request closed during match round", {
-      requestId: request.id,
-      trackingCode: request.tracking_code,
-    });
-    await rollbackJustCreatedMatches(request.id, inserts.map((i) => i.match));
-    return { matched: 0, deliveries: [] as PromiseSettledResult<unknown>[] };
+    // Final safety gate before any notification: confirms the request is still live.
+    const preNotify = await dbGetDoc<BloodRequest>("blood_requests", request.id);
+    if (!preNotify || TERMINAL_REQUEST_STATUSES.includes(preNotify.status)) {
+      log.warn("Notify gate refused — request closed during match round", {
+        requestId: request.id,
+        trackingCode: request.tracking_code,
+      });
+      await rollbackJustCreatedMatches(request.id, inserts.map((i) => i.match));
+      await releaseDonorLock(inserts[0].donor.id, request.id);
+      return { matched: 0, deliveries: [] as PromiseSettledResult<unknown>[] };
+    }
   }
 
   // Test-only fault seam: simulates the requester closing the request in the
@@ -823,21 +934,22 @@ export async function matchAndNotifyRequest(request: BloodRequest) {
   );
 
   // Delivery-time hardening: if the request was closed (or the match resolved)
-  // in the window between match creation and the delivery commit, each affected
-  // notifyDonor returned `suppressed` — no invite was sent and no bookkeeping
-  // written. Roll those invitations back so no actionable invite survives on a
-  // closed request. A suppressed donor must not be told they were contacted.
+  // in the window between match creation and the delivery commit, notifyDonor
+  // returned `suppressed` — no invite was sent. Roll the invitation back so no
+  // actionable invite survives on a closed request; the spent budget is retained
+  // (D1/D2) and the donor lock released.
   const suppressedInserts = inserts.filter((_, i) => {
     const r = deliveries[i];
     return r.status === "fulfilled" && (r.value as NotifyResult).suppressed;
   });
   if (suppressedInserts.length > 0) {
-    log.warn("Notify suppressed — request closed or match resolved before delivery; rolling back invitations", {
+    log.warn("Notify suppressed — request closed or match resolved before delivery; rolling back invitation", {
       requestId: request.id,
       trackingCode: request.tracking_code,
       suppressed: suppressedInserts.length,
     });
     await rollbackJustCreatedMatches(request.id, suppressedInserts.map((i) => i.match));
+    for (const i of suppressedInserts) await releaseDonorLock(i.donor.id, request.id);
   }
 
   if (inserts.length > 0 && suppressedInserts.length === 0) {
@@ -880,125 +992,4 @@ export async function matchAndNotifyRequest(request: BloodRequest) {
   await cacheInvalidatePrefix("eligible_");
   await cacheInvalidatePrefix("req_status_");
   return { matched: inserts.length, deliveries };
-}
-// ponytail: reuses existing matchAndNotifyRequest dedup (acquireDonorLock + alreadyOffered)
-export async function notifyOpenRequestsForNewDonor(
-  donorBloodGroup: string,
-  donorPincode: string,
-) {
-  try {
-    const allRequests = await dbGetCollection<BloodRequest>("blood_requests");
-    const now = nowISO();
-    const URGENCY_RANK: Record<string, number> = { critical: 0, urgent: 1, planned: 2 };
-    const candidates = allRequests
-      .filter((r) =>
-        ACTIVE_REQUEST_STATUSES.includes(r.status) &&
-        (!r.expires_at || r.expires_at >= now) &&
-        (r.blood_type_needed === "ANY" || isBloodCompatible(donorBloodGroup as BloodType, r.blood_type_needed as BloodType)) &&
-        getDistanceBetweenPincodes(donorPincode, r.hospital_pincode) <= 25
-      )
-      .sort((a, b) => {
-        const ur = (URGENCY_RANK[a.urgency_level] ?? 9) - (URGENCY_RANK[b.urgency_level] ?? 9);
-        if (ur !== 0) return ur;
-        return getDistanceBetweenPincodes(donorPincode, a.hospital_pincode) - getDistanceBetweenPincodes(donorPincode, b.hospital_pincode);
-      })
-      .slice(0, 10);
-    for (const req of candidates) {
-      matchAndNotifyRequest(req).catch((e) =>
-        console.error(`[EarlyMatch] matchAndNotify failed for ${req.tracking_code}:`, e.message)
-      );
-    }
-  } catch (e: any) {
-    console.error("[EarlyMatch] Failed to scan open requests:", e.message);
-  }
-}
-
-export async function createNextDonorMatch(request: BloodRequest, excludedDonorId?: string) {
-  // Phase 8: no cascade matches for a closed request — a cancelled/fulfilled/
-  // expired request must not resurrect donor invitations.
-  if (TERMINAL_REQUEST_STATUSES.includes(request.status)) return null;
-  // Phase 8 hardening: never trust a stale snapshot to cascade a match onto a
-  // request the requester closed after the snapshot was read.
-  const liveNow = await dbGetDoc<BloodRequest>("blood_requests", request.id);
-  if (!liveNow || TERMINAL_REQUEST_STATUSES.includes(liveNow.status)) {
-    log.warn("Cascade refused — request closed concurrently", {
-      requestId: request.id,
-      trackingCode: request.tracking_code,
-      staleStatus: request.status,
-      liveStatus: liveNow?.status ?? "missing",
-    });
-    return null;
-  }
-  request = liveNow;
-  const existingMatches = await dbGetCollection<Match>("matches");
-  const excludedDonorIds = new Set(existingMatches.filter((match) => match.request_id === request.id).map((match) => match.donor_id));
-  if (excludedDonorId) {
-    const matchDoc = await dbGetDoc<Match>("matches", excludedDonorId);
-    if (matchDoc) excludedDonorIds.add(matchDoc.donor_id);
-    else excludedDonorIds.add(excludedDonorId);
-  }
-  const eligible = await findEligibleDonors(request);
-
-  // Phase 4: the next donor MUST be reserved atomically — skip any donor whose
-  // reservation lock is held by a different request (double-booking guard).
-  const next = eligible.find((donor) => !excludedDonorIds.has(donor.id));
-  if (!next) return null;
-
-  const lockAcquired = await acquireDonorLock(next.id, request.id);
-  if (!lockAcquired) {
-    console.log(`[Matching] createNextDonorMatch: donor ${next.id} busy elsewhere for request ${request.id} — no cascade match`);
-    return null;
-  }
-
-  const matchId = randomUUID();
-  const match: Match = {
-    id: matchId,
-    request_id: request.id,
-    donor_id: next.id,
-    match_rank: next.match_rank,
-    notification_channel: "whatsapp",
-    notification_sent_at: null,
-    reminder_sent_at: null,
-    donor_response: "pending",
-    donor_response_at: null,
-    contact_shared_at: null,
-    outcome: null,
-    outcome_confirmed_at: null,
-    created_at: nowISO(),
-    distance_km: next.distance_km,
-    is_exact_match: next.is_exact_match,
-    public_token: randomBytes(16).toString("hex"),
-    search_batch: (request.search_batch ?? 1),
-  };
-
-  await dbSaveDoc("matches", matchId, match);
-  // Final live gate before the notification: the lock itself is atomic and
-  // terminal-guarded, but this last re-read lets the cascade roll back cleanly
-  // if the requester closed the request in the microseconds since.
-  const stillLive = await dbGetDoc<BloodRequest>("blood_requests", request.id);
-  if (!stillLive || TERMINAL_REQUEST_STATUSES.includes(stillLive.status)) {
-    await dbDeleteDoc("matches", matchId);
-    await releaseDonorLock(next.id, request.id);
-    log.warn("Cascade notify gate refused — match rolled back", {
-      requestId: request.id,
-      donorId: next.id,
-      matchId,
-    });
-    return null;
-  }
-  const delivery = await notifyDonor(match, request, next);
-  // Delivery-time guard: if the request closed (or the match resolved) during
-  // the final window, notifyDonor suppressed the invite — roll the cascade back
-  // so no actionable invite survives on a closed request.
-  if (delivery.suppressed) {
-    await dbDeleteDoc("matches", matchId);
-    await releaseDonorLock(next.id, request.id);
-    log.warn("Cascade delivery suppressed — match rolled back", {
-      requestId: request.id,
-      donorId: next.id,
-      matchId,
-    });
-    return null;
-  }
-  return { donorId: next.id, donorName: next.full_name };
 }

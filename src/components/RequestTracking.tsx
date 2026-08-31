@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import confetti from 'canvas-confetti';
-import { BloodRequest, Match, MAX_SEARCH_BATCHES } from '../types';
+import { BloodRequest, Match } from '../types';
 import { authenticatedApi } from '../lib/api';
 import { useLanguage } from '../lib/LanguageContext';
 import { getCoordinates } from '../data/pincode_coords';
@@ -137,7 +137,7 @@ try {
  }
 
 if (onStateChange) onStateChange();
-alert(settledReq.status === 'cancelled' ? "Blood request search has been closed (marked cancelled — reopen allowed anytime)." : "Blood request has been marked as fulfilled.");
+ alert(settledReq.status === 'cancelled' ? "Blood request search has been closed (marked cancelled — reopen allowed anytime)." : settledReq.status === 'secured' ? "Request kept open — fulfill only when donations complete." : "Blood request has been marked as fulfilled.");
  } catch (err) {
  console.error(err);
  alert("Failed to update request.");
@@ -164,16 +164,17 @@ alert(settledReq.status === 'cancelled' ? "Blood request search has been closed 
  };
 
  const getStatusBadge = (status: string) => {
- const hasApprovedMatches = matches.some(m => m.donor_response === 'approved');
- const effectiveStatus = (hasApprovedMatches && (status === 'open' || status === 'matching' || status === 'broadcasting')) ? 'partially_matched' : status;
-
- switch (effectiveStatus) {
+ switch (status) {
  case 'open':
  return <span className="inline-flex items-center gap-1.5 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700 border border-amber-200">{isHi ? 'मिलान की प्रतीक्षा' : 'Awaiting Matches'}</span>;
  case 'matching':
  return <span className="inline-flex items-center gap-1.5 bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700 border border-blue-200 animate-pulse">{isHi ? 'रीयल-टाइम खोज जारी' : 'Live Matching'}</span>;
  case 'partially_matched':
  return <span className="inline-flex items-center gap-1.5 bg-vital-50 px-3 py-1 text-xs font-semibold text-vital-700 border border-vital-200 font-bold">{isHi ? 'रक्तदाता स्वीकृत / मैच मिला' : 'Donor Approved / Matched'}</span>;
+ case 'secured':
+ return <span className="inline-flex items-center gap-1.5 bg-vital-50 px-3 py-1 text-xs font-semibold text-vital-700 border border-vital-200 font-bold">{isHi ? 'दाता आरक्षित' : 'Donors Reserved'}</span>;
+ case 'search_exhausted':
+ return <span className="inline-flex items-center gap-1.5 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700 border border-amber-200">{isHi ? 'खोज समाप्त' : 'Search Exhausted'}</span>;
  case 'fulfilled':
  return <span className="inline-flex items-center gap-1.5 bg-vital-50 px-3 py-1 text-xs font-semibold text-vital-700 border border-vital-200">{isHi ? 'पूर्ण हुआ' : 'Fulfilled'}</span>;
  case 'cancelled':
@@ -457,28 +458,38 @@ alert(settledReq.status === 'cancelled' ? "Blood request search has been closed 
  🩸 {isHi ? 'यूनिट पूर्ति प्रगति' : 'Unit Fulfillment Progress'}
  </h3>
  <span className="font-mono text-sm font-bold tabular-nums text-blood-700">
- {(request as any).units_confirmed ?? matches.filter(m => m.donor_response === 'approved').length}/{request.units_required}
+ {(request as any).units_completed ?? 0}/{request.units_required} completed
+ {((request as any).units_confirmed ?? matches.filter(m => m.donor_response === 'approved').length) !== ((request as any).units_completed ?? 0) ? <span className="text-ink-400 font-medium text-[10px] ml-1">· {(request as any).units_confirmed ?? matches.filter(m => m.donor_response === 'approved').length} confirmed</span> : null}
  </span>
  </div>
  <div className="w-full h-3 bg-ink-100 overflow-hidden">
  <div
  className="h-full bg-blood-600 transition-all duration-700 ease-out"
  style={{
- width: `${Math.min(100, (((request as any).units_confirmed ?? matches.filter(m => m.donor_response === 'approved').length) / request.units_required) * 100)}%`,
+ width: `${Math.min(100, (((request as any).units_completed ?? 0) / request.units_required) * 100)}%`,
  }}
  />
  </div>
 <p className="text-[11px] text-ink-500 mt-2 font-medium">
-  {((request as any).units_confirmed ?? matches.filter(m => m.donor_response === 'approved').length) >= request.units_required
-  ? (isHi ? '✅ सभी यूनिट पूर्ण!' : '✅ All units fulfilled!')
-  : (isHi ? '⏳ डोनर्स की प्रतिक्रिया की प्रतीक्षा...' : '⏳ Waiting for donor responses...')
-  }
+  {(() => {
+    const confirmed = (request as any).units_confirmed ?? matches.filter(m => m.donor_response === 'approved').length;
+    const completed = (request as any).units_completed ?? 0;
+    if (['cancelled','fulfilled','expired'].includes(request.status)) {
+      return completed >= request.units_required
+        ? (isHi ? '✅ सभी यूनिट पूर्ण!' : '✅ All units completed!')
+        : (isHi ? 'ℹ️ खोज बंद — दान पूर्ण नहीं' : 'ℹ️ Search closed — donation not completed');
+    }
+    if (confirmed >= request.units_required) {
+      return isHi ? '🧪 डोनर कन्फर्म — दान समाप्ति की प्रतीक्षा' : '🧪 Donors confirmed — awaiting donation completion';
+    }
+    return isHi ? '⏳ डोनर्स की प्रतिक्रिया की प्रतीक्षा...' : '⏳ Waiting for donor responses...';
+  })()}
   </p>
-  {request.search_batch && ['matching', 'partially_matched', 'open'].includes(request.status) && (
-  <p className="text-[10px] uppercase tracking-[0.12em] text-ink-400 mt-1 font-semibold">
-  {isHi ? `🔎 सर्च राउंड ${request.search_batch}/${MAX_SEARCH_BATCHES}` : `🔎 Search round ${request.search_batch}/${MAX_SEARCH_BATCHES}`}
-  </p>
-  )}
+{request.search_batch && ['matching', 'partially_matched', 'secured', 'open', 'search_exhausted'].includes(request.status) && (
+ <p className="text-[10px] uppercase tracking-[0.12em] text-ink-400 mt-1 font-semibold">
+ {isHi ? `🔎 सर्च ब्याज ${request.search_batch}/15` : `🔎 Search budget ${request.search_batch}/15`}
+ </p>
+ )}
   </div>
   )}
 
@@ -553,7 +564,7 @@ alert(settledReq.status === 'cancelled' ? "Blood request search has been closed 
  ) : isPending ? (
  <div className="mt-3 text-xs text-ink-600 bg-ink-50 p-3 border border-ink-100 font-medium leading-relaxed">
  <span className="font-semibold text-blood-600 block mb-0.5">🛡️ Privacy Shield Active</span>
- Personal details hidden until donor replies YES via WhatsApp/Simulator.
+ Personal details hidden until donor replies YES via WhatsApp.
  </div>
  ) : (
  <div className="mt-2 text-xs font-semibold text-ink-400">

@@ -59,8 +59,8 @@ export default function RequestDetailDrawer({ match, request, currentUser, loadi
   const contactShared = isApproved && !!req?.requester_phone;
 
   // Real persisted timeline states only.
-  const isMatching = !!req && ['open', 'broadcasting', 'matching'].includes(req.status);
-  const isConfirmed = !!req && req.status === 'partially_matched';
+  const isMatching = !!req && ['open', 'broadcasting', 'matching', 'search_exhausted'].includes(req.status);
+  const isConfirmed = !!req && ['partially_matched', 'secured'].includes(req.status);
   const isFulfilled = !!req && req.status === 'fulfilled';
   const isCompleted = !!m && m.outcome === 'donated';
   const responded = !!m && m.donor_response !== 'pending';

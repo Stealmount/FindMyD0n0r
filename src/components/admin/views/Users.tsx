@@ -44,7 +44,7 @@ export default function Users({ donors, requesters, loading, search, isHi, onSea
   const [roleFilter, setRoleFilter] = React.useState<UserRole>('all');
 
   const unified = useMemo<UnifiedUser[]>(() => {
-    const ADMIN_EMAIL = import.meta.env?.VITE_ADMIN_EMAIL || 'admin@findmydonor.online';
+    const ADMIN_EMAIL = import.meta.env?.VITE_ADMIN_EMAIL || 'official@findmydonor.online';
     const donorUsers: UnifiedUser[] = donors.map(d => ({
       id: d.id,
       name: d.full_name || '—',

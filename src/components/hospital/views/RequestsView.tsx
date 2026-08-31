@@ -19,7 +19,7 @@ export function RequestsView({ requests, matches, users, isHi, onRequestFulfille
 
   const filtered = requests.filter(r => {
     if (filter === 'all') return true;
-    if (filter === 'active') return r.status === 'open' || r.status === 'matching' || r.status === 'broadcasting' || r.status === 'partially_matched';
+    if (filter === 'active') return r.status === 'open' || r.status === 'matching' || r.status === 'broadcasting' || r.status === 'partially_matched' || r.status === 'secured' || r.status === 'search_exhausted';
     if (filter === 'fulfilled') return r.status === 'fulfilled';
     if (filter === 'cancelled') return r.status === 'cancelled' || r.status === 'expired';
     return true;
@@ -27,7 +27,7 @@ export function RequestsView({ requests, matches, users, isHi, onRequestFulfille
 
   const counts = {
     all: requests.length,
-    active: requests.filter(r => r.status === 'open' || r.status === 'matching' || r.status === 'broadcasting' || r.status === 'partially_matched').length,
+    active: requests.filter(r => r.status === 'open' || r.status === 'matching' || r.status === 'broadcasting' || r.status === 'partially_matched' || r.status === 'secured' || r.status === 'search_exhausted').length,
     fulfilled: requests.filter(r => r.status === 'fulfilled').length,
     cancelled: requests.filter(r => r.status === 'cancelled' || r.status === 'expired').length,
   };
@@ -96,7 +96,7 @@ export function RequestsView({ requests, matches, users, isHi, onRequestFulfille
         <div className="space-y-3">
           {filtered.map(req => {
             const matchedDonors = getMatchedDonors(req.id);
-            const isPending = req.status === 'open' || req.status === 'matching' || req.status === 'broadcasting' || req.status === 'partially_matched';
+            const isPending = req.status === 'open' || req.status === 'matching' || req.status === 'broadcasting' || req.status === 'partially_matched' || req.status === 'secured' || req.status === 'search_exhausted';
             return (
               <motion.div
                 key={req.id}

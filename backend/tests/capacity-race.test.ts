@@ -136,8 +136,8 @@ test('final-slot race: 2 concurrent approvals for the last of 5 units — exactl
 
     const request = await dbGetDoc<{ units_confirmed?: number; status?: string; fulfilled_at?: string | null }>('blood_requests', req.id);
     assert.equal(request?.units_confirmed, 5, 'units_confirmed must be exactly 5');
-    assert.equal(request?.status, 'fulfilled');
-    assert.ok(request?.fulfilled_at, 'fulfilled_at must be stamped');
+    assert.equal(request?.status, 'secured', '5/5 allocation is secured, NOT fulfilled');
+    assert.equal(request?.fulfilled_at ?? null, null, 'secured is not terminal');
 
     // Idempotent duplicate handling: re-approving the winning match is refused.
     const dup = await approveMatchById(claimWinner.id);
@@ -197,7 +197,7 @@ test('multi-approval race: 6 donors race for 5 remaining units — exactly 5 win
 
     const request = await dbGetDoc<{ units_confirmed?: number; status?: string }>('blood_requests', req.id);
     assert.equal(request?.units_confirmed, 5);
-    assert.equal(request?.status, 'fulfilled');
+    assert.equal(request?.status, 'secured', '5/5 allocation is secured, NOT fulfilled (needs donations)');
   } finally {
     await cleanup({ requestId: req.id, matchIds, donorIds });
   }

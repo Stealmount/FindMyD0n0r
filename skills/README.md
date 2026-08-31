@@ -10,7 +10,7 @@ Location: `.agents/AGENTS.md` & `.user_rules/AGENTS.md`
 
 1. **Visual Parity**: Maintain glassmorphic aesthetic defined in `findmydonor` (`--color-blood-*`, `--color-ink-*`, `.glass`, `.btn-glow`).
 2. **Community Platform**: No commercial pricing tiers; 100% free volunteer donor network.
-3. **Core Workflow Preservation**: Retain functional compatibility for `DonorRegistration`, `DonorDashboard`, `RequestForm`, `RequesterPortal`, `RequestTracking`, and `NotificationSimulator`.
+3. **Core Workflow Preservation**: Retain functional compatibility for `DonorRegistration`, `DonorDashboard`, `RequestForm`, `RequesterPortal`, and `RequestTracking`.
 4. **CTA Wiring**: All display CTAs must trigger active view navigation (`setActiveView`).
 5. **TypeScript Rigor**: Strict typing without implicit `any` errors.
 

@@ -5,7 +5,8 @@ import express, { Router } from "express";
 import { randomUUID } from "node:crypto";
 import { getCollection as dbGetCollection, getDoc as dbGetDoc, saveDoc as dbSaveDoc } from "../src/lib/serverDb";
 import { getAuthenticatedUser } from "../middleware/auth";
-import { nowISO } from "../helpers/time";
+import { nowISO, computeCooldownUntil, resolveCooldownDays } from "../helpers/time";
+import { recordDonationCompletion } from "../helpers/completionProvider";
 import { sendErrorResponse, ForbiddenError, NotFoundError, ValidationError } from "../helpers/errors";
 import { enqueueEmail, enqueueWhatsApp } from "../services/notificationService";
 import { sanitizeInstitution } from "../helpers/sanitize";
@@ -36,7 +37,7 @@ const wrap = (handler: express.RequestHandler): express.RequestHandler => (req, 
 
 async function adminCheck(req: express.Request, res: express.Response, next: express.NextFunction) {
   const authUser = await getAuthenticatedUser(req);
-  if (!authUser || (authUser.email !== "admin@findmydonor.online" && (authUser as any).role !== "admin")) {
+  if (!authUser || (authUser.email !== "official@findmydonor.online" && (authUser as any).role !== "admin")) {
     return sendErrorResponse(res, new ForbiddenError("Access denied: Admin privileges required."));
   }
   (req as any).adminUser = authUser;
@@ -69,7 +70,7 @@ async function writeAudit(entry: {
 }
 
 const auditActor = (req: express.Request): string =>
-  ((req as any).adminUser?.email as string) || "admin@findmydonor.online";
+  ((req as any).adminUser?.email as string) || "official@findmydonor.online";
 
 // Bust eligible + linked_profile caches for a profile. Linked_profile is what a
 // donor's next auth/session reads, so admin edits/deletes must never serve stale
@@ -130,28 +131,30 @@ router.patch("/api/admin/donors/:donorId/ban", adminCheck, wrap(async (req, res)
 router.post("/api/admin/donors/:donorId/log-donation", adminCheck, wrap(async (req, res) => {
   const donor = await dbGetDoc<User>("users", req.params.donorId);
   if (!donor) return sendErrorResponse(res, new NotFoundError("Donor not found"));
-  const now = new Date();
-  const cooldownEnd = new Date(now.getTime() + 60 * 24 * 60 * 60 * 1000);
-  const cooldownStr = cooldownEnd.toISOString().split("T")[0];
+  const now = new Date().toISOString();
+  const donationDate = now.split("T")[0];
+  const cooldownStr = computeCooldownUntil(donationDate, resolveCooldownDays(donor));
   await dbSaveDoc("users", donor.id, {
     ...donor,
     account_status: "cooldown",
     cooldown_until: cooldownStr,
-    last_donation_date: now.toISOString().split("T")[0],
-    updated_at: now.toISOString(),
+    last_donation_date: donationDate,
+    updated_at: now,
   });
-  const logId = randomUUID();
+  // Deterministic per-donor-per-day key so a repeated log-donation is idempotent
+  // and never duplicates history.
+  const logId = `admin_log_${donor.id}_${donationDate}`;
   await dbSaveDoc("donation_log", logId, {
     id: logId,
     donor_id: donor.id,
     match_id: null,
     request_id: null,
-    donation_date: now.toISOString().split("T")[0],
+    donation_date: donationDate,
     source: "admin_entered",
     notes: "Cooldown forced by administrator override.",
-    created_at: now.toISOString(),
+    created_at: now,
   });
-  void writeAudit({ actor: auditActor(req), action: "donor_log_donation", entity_type: "donor", entity_id: donor.id, meta: "60-day cooldown applied" });
+  void writeAudit({ actor: auditActor(req), action: "donor_log_donation", entity_type: "donor", entity_id: donor.id, meta: `${resolveCooldownDays(donor)}-day cooldown applied` });
   return res.json({ success: true });
 }));
 
@@ -184,12 +187,19 @@ router.post("/api/admin/matches", adminCheck, wrap(async (req, res) => {
   if (payload.outcome === "donated") {
     const donor = await dbGetDoc<User>("users", existing.donor_id);
     if (donor) {
-      const cooldownEnd = new Date(new Date().getTime() + 60 * 24 * 60 * 60 * 1000);
+      // Route the override through the single completion producer so a donated
+      // override persists an idempotent `donation_<matchId>` log row and applies
+      // the donor's selected cooldown — closing the historical "admin hole" that
+      // set outcome+cooldown but never wrote history.
+      await recordDonationCompletion({
+        matchId,
+        requestId: existing.request_id,
+        donor,
+        confirmedAt: (payload.outcome_confirmed_at as string) || nowISO(),
+      });
       await dbSaveDoc("users", donor.id, {
         ...donor,
-        account_status: "cooldown",
-        cooldown_until: cooldownEnd.toISOString().split("T")[0],
-        last_donation_date: new Date().toISOString().split("T")[0],
+        last_donation_date: nowISO().split("T")[0],
       });
     }
   }
@@ -392,7 +402,7 @@ router.patch("/api/admin/institutions/:id/review", adminCheck, wrap(async (req, 
   const updated = {
     ...institution,
     verification_status: approved ? "verified" : "rejected",
-    reviewed_by: ((req as any).adminUser?.email || "admin@findmydonor.online"),
+    reviewed_by: ((req as any).adminUser?.email || "official@findmydonor.online"),
     reviewed_at: now,
     rejection_reason: approved ? null : String(rejection_reason).trim(),
     updated_at: now,

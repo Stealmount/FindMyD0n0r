@@ -67,7 +67,7 @@ describe('Institution registration + admin review flow', () => {
     await saveDoc('profiles', TEST_PROFILE_ID, {
       full_name: 'Institution Flow Admin',
       phone: '919980000099',
-      email: 'admin@findmydonor.online',
+      email: 'official@findmydonor.online',
       auth_method: 'google',
       onboarding_step: 'complete',
       can_request: true,
@@ -303,7 +303,7 @@ describe('Institution registration + admin review flow', () => {
     const data = await res.json() as any;
     assert.equal(data.success, true);
     assert.equal(data.institution.verification_status, 'verified');
-    assert.equal(data.institution.reviewed_by, 'admin@findmydonor.online');
+    assert.equal(data.institution.reviewed_by, 'official@findmydonor.online');
     assert.ok(data.institution.reviewed_at, 'reviewed_at must be set');
     assert.equal(data.institution.rejection_reason, null);
 

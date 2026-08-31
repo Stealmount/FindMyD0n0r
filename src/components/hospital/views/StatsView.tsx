@@ -49,7 +49,7 @@ export function StatsView({ isHi }: StatsViewProps) {
 
   const totalDonors = data.users.length;
   const activeRequests = data.requests.filter(r =>
-    r.status === 'open' || r.status === 'matching' || r.status === 'broadcasting' || r.status === 'partially_matched'
+    r.status === 'open' || r.status === 'matching' || r.status === 'broadcasting' || r.status === 'partially_matched' || r.status === 'secured' || r.status === 'search_exhausted'
   ).length;
   const fulfilledRequests = data.requests.filter(r => r.status === 'fulfilled').length;
   const totalMatches = data.matches.length;

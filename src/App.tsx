@@ -13,7 +13,7 @@ import AuthIntentSelector from './components/AuthHub/AuthIntentSelector';
 import { DonorOnboardingWizard } from './components/rev3/DonorOnboardingWizard';
 import { RequesterOnboardingWizard } from './components/rev3/RequesterOnboardingWizard';
 import { OnboardingRoleGate } from './components/rev3/OnboardingRoleGate';
-import NotificationSimulator from './components/NotificationSimulator';
+import SupportUsButton from './components/SupportUsButton';
 import { FindMyDonorHome } from './components/home/FindMyDonorHome';
 import { Navbar } from './components/home/Navbar';
 import { MobileBottomNav } from './components/home/MobileBottomNav';
@@ -37,7 +37,7 @@ import { fetchMe, toLegacy, saveOnboardingIntent } from './lib/rev3Auth';
 
 // View → path mapping. Components still call onNavigate(view) — nav() bridges it
 // to react-router navigate(). Added as Task 4.1; kept here for reference.
-const ADMIN_EMAIL = import.meta.env?.VITE_ADMIN_EMAIL || 'admin@findmydonor.online';
+const ADMIN_EMAIL = import.meta.env?.VITE_ADMIN_EMAIL || 'official@findmydonor.online';
 
 const VIEW_PATHS: Record<string, string> = {
   'home': '/',
@@ -609,7 +609,7 @@ function FullScreenRoute({ children, nav }: { children: React.ReactNode; nav: (v
   return (
     <>
       {children}
-      <NotificationSimulator onNavigate={(view) => nav(view as string)} showSupportUs={false} />
+      <SupportUsButton onNavigate={(view) => nav(view as string)} show={false} />
     </>
   );
 }
@@ -637,9 +637,9 @@ function AppShell({ nav, activeView, children }: {
         onNavigate={(view) => nav(view)}
       />
 
-      <NotificationSimulator
+      <SupportUsButton
         onNavigate={(view) => nav(view as string)}
-        showSupportUs={!SUPPORT_US_HIDDEN_VIEWS.has(activeView)}
+        show={!SUPPORT_US_HIDDEN_VIEWS.has(activeView)}
       />
     </div>
   );
@@ -654,7 +654,7 @@ function HomeView({ nav }: { nav: (view: string, push?: boolean, code?: string) 
         activeView="home"
         onNavigate={nav}
       />
-      <NotificationSimulator />
+      <SupportUsButton />
     </div>
   );
 }

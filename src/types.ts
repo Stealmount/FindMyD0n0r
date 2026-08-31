@@ -70,9 +70,9 @@ export type AccountStatus = 'active' | 'cooldown' | 'inactive' | 'banned' | 'del
 
 export type UrgencyLevel = 'critical' | 'urgent' | 'planned';
 
-export type RequestStatus = 'draft' | 'open' | 'broadcasting' | 'matching' | 'partially_matched' | 'fulfilled' | 'expired' | 'cancelled';
+export type RequestStatus = 'draft' | 'open' | 'broadcasting' | 'matching' | 'partially_matched' | 'secured' | 'search_exhausted' | 'fulfilled' | 'expired' | 'cancelled';
 
-export type MatchStatus = 'pending' | 'approved' | 'declined' | 'timed_out';
+export type MatchStatus = 'pending' | 'approved' | 'declined' | 'timed_out' | 'expired';
 
 export type MatchOutcome = 'donated' | 'not_donated' | null;
 
@@ -92,6 +92,7 @@ export interface User {
   donation_frequency: DonationFrequency;
   last_donation_date: string | null; // YYYY-MM-DD
   cooldown_until: string | null; // YYYY-MM-DD
+  cooldown_days?: 60 | 90 | 120; // donor-selectable cooldown period; default 90 when absent
   pincode: string; // 6-digit numeric
   area: string;
   city: string;
@@ -166,6 +167,7 @@ export interface DonorProfile {
   state: string | null;
   last_donation_date: string | null;
   cooldown_until: string | null;
+  cooldown_days?: 60 | 90 | 120;
   health_self_declaration: boolean;
   profile_complete: boolean;
   is_available: boolean;
@@ -225,7 +227,6 @@ export interface BloodRequest {
   created_at: string; // ISO String
   requester_id?: string; // Pointing to logged-in requester UID
   showcase_opt_in?: boolean; // Public feed uses a sanitized projection only
-  broadcast_to_simulator?: boolean; // Requester opt-in to broadcast alert to Live Simulator
   patient_age?: number;
   patient_gender?: 'Male' | 'Female' | 'Other';
   component_needed?: 'Whole Blood (WB)' | 'Packed Red Blood Cells (PRBC)' | 'Single Donor Platelets (SDP)' | 'Random Donor Platelets (RDP)' | 'Fresh Frozen Plasma (FFP)' | 'Cryoprecipitate';
@@ -252,7 +253,9 @@ export {
   HOSPITAL_NETWORKS,
 } from './data/hospitals';
 
-export const MAX_SEARCH_BATCHES = 5; // progressive-search rounds before giving up
+export const MAX_SEARCH_BATCHES = 5; // legacy progressive-search rounds (superseded by MAX_DONOR_BUDGET)
+export const MAX_DONOR_BUDGET = 15; // max unique donors invited per request (sequential 5 → 5 → 5)
+export const INVITATION_TIMEOUT_MINUTES = 5; // donor response window before invite expires
 
 export const BLOOD_COMPONENTS = [
   'Whole Blood (WB)',

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import confetti from 'canvas-confetti';
-import { Requester, BloodRequest, Match, User, MAX_SEARCH_BATCHES } from '../types';
+import { Requester, BloodRequest, Match, User } from '../types';
 import { authenticatedApi } from '../lib/api';
 import { useLanguage } from '../lib/LanguageContext';
 import { StateMessage } from './ui/StateMessage';
@@ -188,17 +188,7 @@ export default function RequesterPortal({
  }
  };
 
- const handleToggleBroadcast = async (req: BloodRequest) => {
- try {
- await authenticatedApi(`/api/requests/${req.tracking_code}/broadcast-toggle`, {}, 'PATCH');
- await loadDashboardData();
- if (onStateChange) onStateChange();
- } catch (err) {
- console.error("Broadcast toggle failed: ", err);
- }
- };
-
- // Rendering Helper: Urgency Style
+// Rendering Helper: Urgency Style
   const getUrgencyBadge = (urgency: string) => {
   switch (urgency) {
   case 'critical':
@@ -212,11 +202,7 @@ export default function RequesterPortal({
 
   // Rendering Helper: Status Badge
   const getStatusBadge = (status: string, reqId?: string) => {
-  const reqMatches = matches.filter(m => m.request_id === (reqId || ''));
-  const hasApproved = reqMatches.some(m => m.donor_response === 'approved');
-  const effectiveStatus = (hasApproved && (status === 'open' || status === 'matching' || status === 'broadcasting')) ? 'partially_matched' : status;
-
-  switch (effectiveStatus) {
+  switch (status) {
   case 'draft':
   return <span className="inline-flex items-center bg-ink-100 px-2.5 py-0.5 text-[10px] font-semibold text-ink-600 border border-ink-200 uppercase">Draft</span>;
   case 'broadcasting':
@@ -227,6 +213,10 @@ export default function RequesterPortal({
   return <span className="inline-flex items-center bg-blood-50 px-2.5 py-0.5 text-[10px] font-semibold text-blood-700 border border-blood-200 uppercase animate-pulse">{isHi ? 'मिलान जारी' : 'Matching'}</span>;
   case 'partially_matched':
   return <span className="inline-flex items-center bg-blood-600 px-2.5 py-0.5 text-[10px] font-semibold text-white border border-blood-600 uppercase font-bold">{isHi ? 'दाता मिला' : 'Donor Matched'}</span>;
+  case 'secured':
+  return <span className="inline-flex items-center bg-blood-600 px-2.5 py-0.5 text-[10px] font-semibold text-white border border-blood-600 uppercase font-bold">{isHi ? 'दाता आरक्षित' : 'Donors Reserved'}</span>;
+  case 'search_exhausted':
+  return <span className="inline-flex items-center bg-amber-600 px-2.5 py-0.5 text-[10px] font-semibold text-white border border-amber-600 uppercase">{isHi ? 'खोज समाप्त' : 'Search Exhausted'}</span>;
   case 'fulfilled':
   return <span className="inline-flex items-center bg-blood-600 px-2.5 py-0.5 text-[10px] font-semibold text-white border border-blood-600 uppercase">{isHi ? 'पूर्ण हुआ' : 'Fulfilled'}</span>;
   case 'cancelled':
@@ -378,7 +368,7 @@ export default function RequesterPortal({
     </div>
    </div>
     <p className="font-display text-2xl font-extrabold tabular-nums text-ink-900 mt-2">
-     {requests.filter(r => ['open', 'broadcasting', 'matching', 'partially_matched'].includes(r.status)).length}
+     {requests.filter(r => ['open', 'broadcasting', 'matching', 'partially_matched', 'secured', 'search_exhausted'].includes(r.status)).length}
     </p>
   </div>
 
@@ -427,7 +417,7 @@ export default function RequesterPortal({
       <div className="flex flex-wrap items-center gap-3 pt-1 text-xs font-semibold text-ink-500">
        <div className="flex items-center gap-1.5">
         <span className="w-1.5 h-1.5 rounded-full bg-blood-600 animate-pulse" />
-        <span>{requests.filter(r => ['broadcasting', 'open', 'matching', 'partially_matched'].includes(r.status)).length} Active</span>
+        <span>{requests.filter(r => ['broadcasting', 'open', 'matching', 'partially_matched', 'secured', 'search_exhausted'].includes(r.status)).length} Active</span>
        </div>
        <div className="flex items-center gap-1.5">
         <span className="w-1.5 h-1.5 rounded-full bg-ink-300" />
@@ -600,7 +590,7 @@ export default function RequesterPortal({
   )}
 
   <div className="mt-1.5 text-[10px] text-ink-400">
-  {new Date(req.created_at).toLocaleDateString()}
+   {new Date(req.fulfilled_at || req.created_at).toLocaleDateString()}
   </div>
   </button>
   );
@@ -662,9 +652,9 @@ export default function RequesterPortal({
  {selectedMatches.length} {isHi ? 'मिले' : 'matched'}
  </span>
  </div>
- {selectedRequest.search_batch && ['matching', 'partially_matched', 'open'].includes(selectedRequest.status) && (
+ {selectedRequest.search_batch && ['matching', 'partially_matched', 'secured', 'open', 'search_exhausted'].includes(selectedRequest.status) && (
  <p className="text-[10px] uppercase tracking-[0.12em] text-ink-400 mb-4 font-semibold -mt-2">
- {isHi ? `🔎 सर्च राउंड ${selectedRequest.search_batch}/${MAX_SEARCH_BATCHES}` : `🔎 Search round ${selectedRequest.search_batch}/${MAX_SEARCH_BATCHES}`}
+ {isHi ? `🔎 सर्च ब्याज ${selectedRequest.search_batch}/15` : `🔎 Search budget ${selectedRequest.search_batch}/15`}
  </p>
  )}
 

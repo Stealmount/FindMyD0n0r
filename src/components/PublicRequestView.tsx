@@ -38,6 +38,8 @@ const STATUS_LABELS: Record<string, { en: string; hi: string; color: string }> =
   matching: { en: 'Matching Donors', hi: 'दाता खोज रहे', color: 'bg-blue-50 text-blue-700 border-blue-200' },
   broadcasting: { en: 'Broadcasting', hi: 'प्रसारण जारी', color: 'bg-blue-50 text-blue-700 border-blue-200' },
   partially_matched: { en: 'Partially Matched', hi: 'आंशिक मिलान', color: 'bg-vital-50 text-vital-700 border-vital-200' },
+  secured: { en: 'Donors Reserved', hi: 'दाता आरक्षित', color: 'bg-vital-50 text-vital-700 border-vital-200' },
+  search_exhausted: { en: 'Search Exhausted', hi: 'खोज समाप्त', color: 'bg-amber-50 text-amber-700 border-amber-200' },
   fulfilled: { en: 'Fulfilled', hi: 'पूर्ण', color: 'bg-vital-50 text-vital-700 border-vital-200' },
   cancelled: { en: 'Cancelled', hi: 'रद्द', color: 'bg-ink-100 text-ink-600 border-ink-200' },
   expired: { en: 'Expired', hi: 'समय सीमा समाप्त', color: 'bg-ink-100 text-ink-600 border-ink-200' },

@@ -19,7 +19,7 @@ import {
 } from "../src/lib/waha";
 import { buildRequesterConfirmEmailHTML, buildDonorConfirmedDetailsEmailHTML } from "../src/lib/email";
 import { sendEmailViaResend } from "../services/notificationService";
-import { createNextDonorMatch, TERMINAL_REQUEST_STATUSES, releaseDonorLock } from "../services/matchingEngine";
+import { matchAndNotifyRequest, TERMINAL_REQUEST_STATUSES, releaseDonorLock, declineMatchIfPending } from "../services/matchingEngine";
 import { reconcileRequestLifecycle } from "../helpers/requestLifecycle";
 import { claimUnitSlot, computeApprovedSlots } from "../helpers/capacityClaim";
 import { sendErrorResponse, UnauthorizedError, ValidationError, ForbiddenError, ServiceUnavailableError } from "../helpers/errors";
@@ -49,7 +49,7 @@ router.post("/api/send-email", rateLimitMiddleware(10, 60_000), wrap(async (req,
     return sendErrorResponse(res, new ValidationError("Missing: to, subject, text"));
   }
   const recipient = to.toLowerCase().trim();
-  let recipientAllowed = recipient === "admin@findmydonor.online" || recipient === authUser.email.toLowerCase();
+  let recipientAllowed = recipient === "official@findmydonor.online" || recipient === authUser.email.toLowerCase();
   if (!recipientAllowed) {
     const linkedId = await getUpstash().hget(k("h:email_to_uid"), recipient);
     if (linkedId) recipientAllowed = Boolean(await storeGet("profiles", String(linkedId)));
@@ -106,8 +106,10 @@ router.post("/api/waha/webhook", wrap(async (req, res) => {
 
     // Find their pending match (prefer specific match ID from button payload)
     const allMatches = await dbGetCollection<Match>("matches");
+    // C-2: a specific button payload (ACCEPT_/DECLINE_<matchId>) may only address
+    // the RESPONDING donor's OWN pending match — never another donor's row.
     const pendingMatch = specificMatchId
-      ? (allMatches.find((m) => m.id === specificMatchId && m.donor_response === "pending") ||
+      ? (allMatches.find((m) => m.id === specificMatchId && m.donor_id === donor.id && m.donor_response === "pending") ||
          allMatches.find((m) => m.donor_id === donor.id && m.donor_response === "pending"))
       : allMatches.find((m) => m.donor_id === donor.id && m.donor_response === "pending");
 
@@ -281,12 +283,11 @@ router.post("/api/waha/webhook", wrap(async (req, res) => {
       await cacheInvalidatePrefix("match_status_");
 
     } else {
-      // Decline match
-      await dbSaveDoc("matches", pendingMatch.id, {
-        ...pendingMatch,
-        donor_response:    "declined",
-        donor_response_at: nowISO(),
-      });
+      // Decline match — C-2: atomic + ownership-bound. Only THIS donor's own
+      // pending match (pendingMatch already bounds donor_id) may be declined, and
+      // only if it is still pending — never overwrite a concurrent approve/expire.
+      const declined = await declineMatchIfPending(pendingMatch.id, nowISO());
+      if (!declined) return; // already resolved concurrently — nothing to decline
 
       await sendDonorWhatsApp(
         donor,
@@ -294,10 +295,11 @@ router.post("/api/waha/webhook", wrap(async (req, res) => {
       );
 
       // Auto-find next donor — release this donor's reservation lock first so
-      // the declined donor is free again AND the next donor gets acquired a lock
-      // inside createNextDonorMatch (no double-booking across concurrent requests).
+      // the declined donor is free again; then route through the single owner
+      // (matchAndNotifyRequest), which alone enforces the budget, pending-invite,
+      // capacity, dedup and eligibility gates (no double-booking, no donor #16).
       await releaseDonorLock(donor.id, pendingMatch.request_id);
-      await createNextDonorMatch(request, pendingMatch.id);
+      await matchAndNotifyRequest(request);
 
       await cacheInvalidatePrefix("pending_matches_");
       await cacheInvalidatePrefix("req_status_");

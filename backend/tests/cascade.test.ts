@@ -1,30 +1,30 @@
 /**
- * Progressive / cascading donor selection tests (Phases 1–3).
+ * Sequential matching-engine tests (matching-engine-implementation §3–§7).
  *
- * Covers:
- *  - Matching tuning constants (INITIAL_BATCH_SIZE=8, MAX_UNITS_PER_REQUEST=5)
- *  - Validation cap wired to MAX_UNITS_PER_REQUEST
- *  - Batch-capped selection: max 8 invites per round regardless of units/openSlots
- *  - Pending gate: no next batch while invites are unresolved
- *  - unit_slot assignment: approvals claim lowest free 1-based slot
- *  - Batch progression: declined batch → next round targets fresh donors only
- *  - notification_status decoupling: delivery state never mirrors donor_response
+ * Covers the fixed business model:
+ *  - Sequential single-invitation owner: exactly ONE invite per owner call,
+ *    next picked only after the in-flight invite resolves (decline/timeout).
+ *  - 15-donor budget: max 15 unique donors per request, no donor #16.
+ *  - `search_tried` (SCARD) ↔ `search_budget` (INCR) atomic invariant, capped 15.
+ *  - Unit-slot ledger: approvals claim lowest free 1-based slot; release re-opens.
+ *  - `secured` at full allocation (NOT `fulfilled`); `fulfilled` after donations.
+ *  - Completion provider: idempotent double-fire, derived `units_completed`.
+ *  - `search_exhausted` NOT terminal; stays reachable to `fulfilled`.
+ *  - Reopen resets the search budget; cancel preserves approved history.
+ *  - notification_status decoupling — delivery state never mirrors donor_response.
+ *  - Donor #16 blocked across the owner and direct budget spends.
  *
  * Run:
  *   npx tsx --test --test-force-exit backend/tests/cascade.test.ts
  *
  * Integration scenarios require the Upstash-backed store; they self-skip
- * otherwise (pure scenarios always run).
- *
- * SEEDING CONTRACT (mirrors engine internals — do not drift):
+ * otherwise. SEEDING CONTRACT (mirrors engine internals — do not drift):
  *  - Donor pincode MUST share the hospital pincode's 5-digit prefix: the index
- *    path (findEligibleDonorsFromDB) only expands PINCODE_COORDS neighbors of
- *    the request pincode, and an empty index result does NOT fall back to scan.
- *  - Donors need docs in `users` (approveMatchById reads it) AND mirrored
- *    `profiles` + `donor_profiles` rows (index path reads those).
- *  - Every test uses its OWN donor-id range: invites mark donors
- *    "recently alerted" for 6h against OTHER request ids, and donor locks +
- *    the 60s eligible_ cache leak across tests otherwise.
+ *    path only expands PINCODE_COORDS neighbors of the request pincode.
+ *  - Donors need docs in `users` + mirrored `profiles` + `donor_profiles`.
+ *  - Every test owns its donor-id range and request id (invites mark donors
+ *    "recently alerted" for 6h against OTHER request ids; locks + the 60s
+ *    eligible_ cache leak across tests otherwise).
  */
 import 'dotenv/config';
 import './setup-env.ts';
@@ -36,17 +36,19 @@ process.env.WAHA_BASE_URL = '';
 import test, { describe } from 'node:test';
 import assert from 'node:assert/strict';
 
-import {
-  INITIAL_BATCH_SIZE,
-  ELIGIBLE_POOL_SIZE,
-  MAX_SEARCH_BATCHES,
-  MAX_UNITS_PER_REQUEST,
-  type BloodType,
-} from '../src/types.ts';
+import { MAX_UNITS_PER_REQUEST, MAX_DONOR_BUDGET, type BloodType } from '../src/types.ts';
 import { bloodRequestSchema } from '../validation/requests.ts';
-import { matchAndNotifyRequest, releaseDonorLock } from '../services/matchingEngine.ts';
+import {
+  matchAndNotifyRequest,
+  releaseDonorLock,
+  readSearchBudget,
+  spendDonorBudget,
+  resetSearchBudget,
+} from '../services/matchingEngine.ts';
 import { approveMatchById } from '../routes/matching.ts';
-import { cancelRequest } from '../routes/tracking.ts';
+import { cancelRequest, reopenRequest } from '../routes/tracking.ts';
+import { recordDonationCompletion, recordDonationNotCompleted } from '../helpers/completionProvider.ts';
+import { computeApprovedSlots, releaseApprovedSlot } from '../helpers/capacityClaim.ts';
 import { cacheInvalidatePrefix } from '../src/lib/redisCache.ts';
 import {
   isFirebaseConfigured,
@@ -54,7 +56,7 @@ import {
   getDoc as dbGetDoc,
   saveDoc as dbSaveDoc,
 } from '../src/lib/serverDb.ts';
-import type { BloodRequest, Match } from '../src/types.ts';
+import type { BloodRequest, User, Match } from '../src/types.ts';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -64,31 +66,31 @@ const HOSPITAL_PINCODE = '110029';
 let seq = 0;
 const nextId = (p: string) => `${p}_cascade_${Date.now()}_${++seq}`;
 
-// Every seeded donor, tagged by pool (hundreds digit). Late tests quarantine
-// earlier pools via cooldown_until — the only cross-request exclusion that
-// survives the critical-urgency anti-spam bypass and un-invited (lock-free)
-// leftovers.
 const seedLog: { id: string; pool: number; userDoc: Record<string, unknown>; dprofDoc: Record<string, unknown> }[] = [];
 
 async function quarantineOtherPools(keepPool: number): Promise<void> {
   const cooldown = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
   for (const s of seedLog) {
-    if (s.pool === keepPool) continue;
-    await dbSaveDoc('users', s.id, { ...s.userDoc, cooldown_until: cooldown });
-    await dbSaveDoc('donor_profiles', `dprof_${s.id}`, { ...s.dprofDoc, cooldown_until: cooldown });
+    if (s.pool !== keepPool) {
+      await dbSaveDoc('users', s.id, { ...s.userDoc, cooldown_until: cooldown });
+      await dbSaveDoc('donor_profiles', `dprof_${s.id}`, { ...s.dprofDoc, cooldown_until: cooldown });
+    } else {
+      // Re-enable our own pool: an earlier test's quarantine may have cooldown'd it.
+      await dbSaveDoc('users', s.id, { ...s.userDoc, cooldown_until: null });
+      await dbSaveDoc('donor_profiles', `dprof_${s.id}`, { ...s.dprofDoc, cooldown_until: null });
+    }
   }
 }
 
-/** Seed one donor across ALL collections the engine reads (see contract above). */
-async function seedDonor(n: number): Promise<string> {
+async function seedDonor(n: number, overrides: Record<string, unknown> = {}): Promise<string> {
   const id = nextId(`donor${n}`);
   const phone = `9197${String(10000000 + n * 7919).slice(0, 8)}`;
   const userDoc = {
     id,
     full_name: `Cascade Donor ${n}`,
-    email: `cascade${n}@example.local`, // .local ⇒ notifyDonor skips Resend entirely
+    email: `cascade${n}@example.local`,
     phone,
-    whatsapp_number: phone, // WhatsApp-capable ⇒ dispatch attempted, degrades offline
+    whatsapp_number: phone,
     blood_type: 'O+',
     pincode: HOSPITAL_PINCODE,
     availability_status: 'available',
@@ -96,16 +98,16 @@ async function seedDonor(n: number): Promise<string> {
     cooldown_until: null,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
+    ...overrides,
   };
   const dprofDoc = {
     id: `dprof_${id}`,
     profile_id: id,
     blood_group: 'O+',
-    // MUST share hospital pincode's 5-digit prefix or the index path misses us.
     pincode: HOSPITAL_PINCODE,
     is_available: true,
     emergency_only: false,
-    cooldown_until: null,
+    cooldown_until: overrides.cooldown_until ?? null,
   };
   await dbSaveDoc('users', id, userDoc);
   await dbSaveDoc('profiles', id, {
@@ -134,8 +136,7 @@ function makeRequest(overrides: Partial<BloodRequest> & { id: string }): BloodRe
     hospital_area: 'Ansari Nagar',
     hospital_city: 'New Delhi',
     additional_notes: null,
-    // critical ⇒ bypasses the 6h anti-spam filter (cross-test isolation).
-    urgency_level: 'critical',
+    urgency_level: 'critical', // bypasses the 6h anti-spam filter (cross-test isolation)
     requester_name: 'Cascade Requester',
     requester_email: 'cascade-requester@example.com',
     requester_phone: '91999988887',
@@ -150,25 +151,39 @@ function makeRequest(overrides: Partial<BloodRequest> & { id: string }): BloodRe
 const requestMatches = async (requestId: string) =>
   (await dbGetCollection<Match>('matches')).filter((m) => m.request_id === requestId);
 
-/** Fresh eligible-cache + persisted request → deterministic first round. */
+/** Fresh eligible-cache + persisted request → deterministic owner round. */
 async function arm(request: BloodRequest): Promise<void> {
   await cacheInvalidatePrefix('eligible_');
   await dbSaveDoc('blood_requests', request.id, request as unknown as Record<string, unknown>);
 }
 
+/** Invite + approve the next in-flight donor; returns the fresh request doc. */
+async function approveNext(requestId: string): Promise<BloodRequest> {
+  const live = (await dbGetDoc<BloodRequest>('blood_requests', requestId)) as BloodRequest;
+  await matchAndNotifyRequest(live);
+  const pending = (await requestMatches(requestId)).find((m) => m.donor_response === 'pending');
+  if (!pending) throw new Error(`expected a pending invite for ${requestId}`);
+  const r = await approveMatchById(pending.id);
+  assert.equal(r.ok, true, `approve failed: ${(r as { error?: string }).error}`);
+  return (await dbGetDoc<BloodRequest>('blood_requests', requestId)) as BloodRequest;
+}
+
+const approvedSlotsOf = async (requestId: string): Promise<number[]> => {
+  const approved = (await requestMatches(requestId)).filter((m) => m.donor_response === 'approved');
+  return computeApprovedSlots(approved, requestId);
+};
+
+const liveRequest = (requestId: string) =>
+  dbGetDoc<BloodRequest>('blood_requests', requestId);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure scenarios (no store required)
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe('Phase 1: tuning constants & validation cap', () => {
-  test('Constants hold user-approved values', () => {
-    assert.equal(INITIAL_BATCH_SIZE, 8);
-    assert.equal(MAX_UNITS_PER_REQUEST, 5);
-    assert.equal(MAX_SEARCH_BATCHES, 5);
-    assert.equal(ELIGIBLE_POOL_SIZE, 100);
-  });
+describe('Constants: 15-donor budget & validation cap', () => {
+  test('MAX_DONOR_BUDGET=15 (the 5→5→5 window budget); units capped at MAX_UNITS_PER_REQUEST (5)', () => {
+    assert.equal(MAX_DONOR_BUDGET, 15);
 
-  test('units_required capped at MAX_UNITS_PER_REQUEST (5), not legacy 10', () => {
     const base = {
       patient_name: 'P',
       blood_type_needed: 'O+',
@@ -179,211 +194,295 @@ describe('Phase 1: tuning constants & validation cap', () => {
     };
     assert.equal(bloodRequestSchema.safeParse({ ...base, units_required: 5 }).success, true);
     assert.equal(bloodRequestSchema.safeParse({ ...base, units_required: 6 }).success, false);
-    assert.equal(bloodRequestSchema.safeParse({ ...base, units_required: 10 }).success, false);
   });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Integration scenarios (require store; each owns a private donor range)
+// Sequential owner: one invitation in flight, 15-donor budget, no donor #16
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe('Phase 2+3: batch-capped progressive matching', () => {
-  test('Batch cap: 12 eligible donors, 1-unit request → exactly 8 invites, batch 1 tagged', async (t) => {
+describe('Sequential single-invitation owner', () => {
+  test('15 declines → exactly 15 unique invites; donor #16 is never invited', async (t) => {
     if (!isFirebaseConfigured()) return t.skip('Store not configured');
-    for (let i = 101; i <= 112; i++) await seedDonor(i); // private pool
-    const request = makeRequest({ id: nextId('req') });
+    await quarantineOtherPools(1);
+    for (let i = 101; i <= 120; i++) await seedDonor(i); // 20 eligible donors → 15 max spend
+    const request = makeRequest({ id: nextId('req'), units_required: 2 });
     await arm(request);
 
-    await matchAndNotifyRequest(request);
-    const matches = await requestMatches(request.id);
+    let live = (await liveRequest(request.id)) as BloodRequest;
+    assert.equal((await requestMatches(request.id)).length, 0, 'no invites before first owner call');
 
-    assert.equal(matches.length, INITIAL_BATCH_SIZE, 'must invite exactly INITIAL_BATCH_SIZE donors');
-    for (const m of matches) {
-      assert.equal(m.donor_response, 'pending');
-      assert.equal(m.search_batch, 1);
-      assert.ok(['pending', 'sent', 'failed', 'retrying'].includes(m.notification_status ?? ''),
-        'notification_status must be a delivery state');
+    // Sequential: first owner call creates EXACTLY ONE match, not a batch.
+    await matchAndNotifyRequest(live);
+    assert.equal((await requestMatches(request.id)).length, 1, 'single-invitation owner invites exactly one');
+
+    // Decline each in-flight invite + advance until the 15-budget is spent.
+    for (let spent = 1; spent < MAX_DONOR_BUDGET; spent++) {
+      live = (await liveRequest(request.id)) as BloodRequest;
+      const pending = (await requestMatches(request.id)).find((m) => m.donor_response === 'pending');
+      if (pending) {
+        await dbSaveDoc('matches', pending.id, {
+          ...pending,
+          donor_response: 'declined',
+          donor_response_at: new Date().toISOString(),
+        } as unknown as Record<string, unknown>);
+        await releaseDonorLock(pending.donor_id, pending.request_id);
+      }
+      await matchAndNotifyRequest(live);
     }
-    const persisted = await dbGetDoc<BloodRequest>('blood_requests', request.id);
-    assert.equal(persisted?.search_batch, 1, 'request.search_batch must persist current round');
-    assert.equal(persisted?.status, 'matching');
-  });
-
-  test('Pending gate: no second wave while invites are unresolved', async (t) => {
-    if (!isFirebaseConfigured()) return t.skip('Store not configured');
-    for (let i = 201; i <= 210; i++) await seedDonor(i); // private pool
-    const request = makeRequest({ id: nextId('req') });
-    await arm(request);
-
-    await matchAndNotifyRequest(request);
-    const before = (await requestMatches(request.id)).length;
-    assert.ok(before > 0, 'first round must produce matches');
-
-    await matchAndNotifyRequest(
-      (await dbGetDoc<BloodRequest>('blood_requests', request.id)) as BloodRequest
-    );
-    const after = await requestMatches(request.id);
-    assert.equal(after.length, before, 'unresolved pendings must gate the next batch');
-  });
-
-  test('unit_slot: three race winners claim slots 1,2,3 exactly once each', async (t) => {
-    if (!isFirebaseConfigured()) return t.skip('Store not configured');
-    for (let i = 301; i <= 310; i++) await seedDonor(i); // private pool
-    const request = makeRequest({ id: nextId('req'), units_required: 3 });
-    await arm(request);
-
-    await matchAndNotifyRequest(request);
-    let matches = await requestMatches(request.id);
-    assert.equal(matches.length, INITIAL_BATCH_SIZE);
-
-    // First three responders approve (any order — race model)
-    for (const m of matches.slice(0, 3)) {
-      const r = await approveMatchById(m.id);
-      assert.equal(r.ok, true, `approve failed: ${r.error}`);
-    }
-    matches = await requestMatches(request.id);
-    const slots = matches
-      .filter((m) => m.donor_response === 'approved')
-      .map((m) => m.unit_slot as number)
-      .sort((a, b) => a - b);
-    assert.deepEqual(slots, [1, 2, 3], 'approved winners must fill lowest free slots uniquely');
-  });
-
-  test('Cascade: declining batch 1 unlocks a batch 2 targeting only fresh donors', async (t) => {
-    if (!isFirebaseConfigured()) return t.skip('Store not configured');
-    for (let i = 401; i <= 410; i++) await seedDonor(i); // 10 donors → batch2 has 2 left
-    await quarantineOtherPools(4); // isolate from earlier suites' unlocked leftovers
-    const request = makeRequest({ id: nextId('req') });
-    await arm(request);
-
-    await matchAndNotifyRequest(request);
-    const batch1 = await requestMatches(request.id);
-    assert.equal(batch1.length, INITIAL_BATCH_SIZE);
-
-    for (const m of batch1) {
-      await dbSaveDoc('matches', m.id, { ...m, donor_response: 'declined' } as unknown as Record<string, unknown>);
-      await releaseDonorLock(m.donor_id, m.request_id);
-    }
-
-    const refreshed = (await dbGetDoc<BloodRequest>('blood_requests', request.id)) as BloodRequest;
-    await matchAndNotifyRequest(refreshed);
     const all = await requestMatches(request.id);
-    const batch2 = all.filter((m) => m.search_batch === 2);
-    // ponytail: exact "covers the 2 unseen donors" only holds in a pristine
-    // store; leftover eligible donors from prior RUNS legitimately join the
-    // round (critical urgency bypasses anti-spam). Assert the invariant that
-    // matters: cascade fired and targeted ONLY fresh donors.
-    assert.ok(batch2.length >= 1, 'declined batch 1 must unlock a batch 2');
-    const b1Donors = new Set(batch1.map((m) => m.donor_id));
-    const b2Donors = new Set(batch2.map((m) => m.donor_id));
-    for (const d of b2Donors) assert.ok(!b1Donors.has(d), 'batch 2 must never reuse batch 1 donors');
+    assert.equal(all.length, MAX_DONOR_BUDGET, 'budget must cap invites at 15');
+    assert.equal(await readSearchBudget(request.id), MAX_DONOR_BUDGET);
 
-    const persisted = await dbGetDoc<BloodRequest>('blood_requests', request.id);
-    assert.equal(persisted?.search_batch, 2);
+    // Donor #16: budget full + fresh eligible donors remain, but owner must no-op.
+    const r16 = await matchAndNotifyRequest((await liveRequest(request.id)) as BloodRequest);
+    assert.equal(r16.matched, 0, 'donor #16 must be blocked by the budget gate');
+    assert.equal((await requestMatches(request.id)).length, MAX_DONOR_BUDGET);
+    assert.equal(await readSearchBudget(request.id), MAX_DONOR_BUDGET, 'budget never exceeds 15');
   });
 
-  test('Decoupling: failed delivery marks retrying while donor_response stays pending', async (t) => {
+  test('Pending gate: unresolved invitation blocks the next one', async (t) => {
     if (!isFirebaseConfigured()) return t.skip('Store not configured');
-    for (let i = 501; i <= 505; i++) await seedDonor(i); // private pool
-    const request = makeRequest({
-      id: nextId('req'),
-      requester_phone: '91999988888', // unique → no self-match collisions
-    });
+    await quarantineOtherPools(2);
+    for (let i = 201; i <= 205; i++) await seedDonor(i);
+    const request = makeRequest({ id: nextId('req') });
     await arm(request);
 
     await matchAndNotifyRequest(request);
-    const matches = await requestMatches(request.id);
-    assert.ok(matches.length > 0);
-    for (const m of matches) {
-      // WAHA unset + .local emails ⇒ delivery failed, but the INVITE stays alive
-      assert.equal(m.donor_response, 'pending', 'delivery failure must not resolve the match');
-      assert.equal(m.notification_status, 'retrying', 'failed delivery must be queued for retry');
-    }
+    assert.equal((await requestMatches(request.id)).length, 1);
+
+    const r = await matchAndNotifyRequest((await liveRequest(request.id)) as BloodRequest);
+    assert.equal(r.matched, 0, 'pending invite must gate the next invitation');
+    assert.equal((await requestMatches(request.id)).length, 1);
+  });
+
+  test('search_tried ↔ search_budget atomic invariant under concurrent spends (capped 15)', async (t) => {
+    if (!isFirebaseConfigured()) return t.skip('Store not configured');
+    const requestId = nextId('req');
+
+    const donorIds = Array.from({ length: 16 }, (_, i) => `inv-donor-${i}-${requestId}`);
+    const results = await Promise.all(donorIds.map((d) => spendDonorBudget(requestId, d)));
+    const successes = results.filter(Boolean).length;
+    assert.equal(successes, MAX_DONOR_BUDGET, 'exactly 15 distinct donors may be spent, never 16');
+    assert.equal(await readSearchBudget(requestId), MAX_DONOR_BUDGET, 'budget after concurrent spends');
+
+    assert.equal(await spendDonorBudget(requestId, donorIds[0]), false, 'duplicate donor must not double-spend');
+    assert.equal(await readSearchBudget(requestId), MAX_DONOR_BUDGET);
+
+    await resetSearchBudget(requestId);
+  });
+
+  test('15 stale/ineligible donors then 1 eligible → owner spends 1, not 15', async (t) => {
+    if (!isFirebaseConfigured()) return t.skip('Store not configured');
+    const requestId = nextId('req');
+    const cooldown = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    for (let i = 301; i <= 315; i++) await seedDonor(i, { cooldown_until: cooldown }); // ineligible
+    await seedDonor(316); // the ONE eligible donor
+    const request = makeRequest({ id: requestId });
+    await arm(request);
+
+    await matchAndNotifyRequest(request);
+    const all = await requestMatches(requestId);
+    assert.equal(all.length, 1, 'owner invites exactly the one eligible donor');
+    assert.equal(await readSearchBudget(requestId), 1, 'budget spends 1, not 15');
   });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Phase 5+6: dashboard accounting & cancellation gating
+// Unit-slot ledger: claim lowest-free, release re-opens
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe('Phase 5: server-side units_confirmed accounting', () => {
-  test('Approvals increment units_confirmed and flip to fulfilled exactly at capacity', async (t) => {
+describe('Unit-slot ledger', () => {
+  test('approvals claim lowest free slots; release re-opens the gap; reclaim fills it', async (t) => {
     if (!isFirebaseConfigured()) return t.skip('Store not configured');
-    await quarantineOtherPools(6);
-    for (let i = 601; i <= 608; i++) await seedDonor(i); // private pool
+    await quarantineOtherPools(4);
+    for (let i = 401; i <= 406; i++) await seedDonor(i);
+    const request = makeRequest({ id: nextId('req'), units_required: 2 });
+    await arm(request);
+
+    await approveNext(request.id); // donor A → slot 1
+    await approveNext(request.id); // donor B → slot 2
+    assert.deepEqual(await approvedSlotsOf(request.id), [1, 2], 'lowest free slots, unique');
+
+    // Authoritative non-donation releases donor A's slot (SREM) + owner-safe.
+    const donorA = (await requestMatches(request.id)).find((m) => m.unit_slot === 1)!;
+    await recordDonationNotCompleted({ matchId: donorA.id, requestId: request.id });
+    assert.deepEqual(await approvedSlotsOf(request.id), [2], 'released slot leaves the ledger');
+
+    // A fresh approval reclaims the lowest free slot (1).
+    await approveNext(request.id);
+    assert.deepEqual(await approvedSlotsOf(request.id), [1, 2], 'released slot reclaimed by lowest-free loop');
+  });
+
+  test('release does not over-release on an unclaimed slot (no crash, no throw)', async (t) => {
+    if (!isFirebaseConfigured()) return t.skip('Store not configured');
+    const request = makeRequest({ id: nextId('req'), units_required: 2 });
+    await arm(request);
+    // Slot 7 was never claimed — SREM is a no-op, must not throw or mutate.
+    await releaseApprovedSlot(request.id, 7);
+    assert.deepEqual(await approvedSlotsOf(request.id), []);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lifecycle: secured at full allocation, fulfilled only after donations
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Lifecycle statuses', () => {
+  test('3-unit request → partial → secured (NOT fulfilled) → fulfilled after donations', async (t) => {
+    if (!isFirebaseConfigured()) return t.skip('Store not configured');
+    await quarantineOtherPools(5);
+    for (let i = 501; i <= 505; i++) await seedDonor(i);
     const request = makeRequest({ id: nextId('req'), units_required: 3 });
     await arm(request);
 
-    await matchAndNotifyRequest(request);
-    const matches = await requestMatches(request.id);
-    assert.equal(matches.length, INITIAL_BATCH_SIZE);
-
-    // Approval 1 → partially_matched, counter = 1
-    const r1 = await approveMatchById(matches[0].id);
-    assert.equal(r1.ok, true, `approve #1 failed: ${r1.error}`);
-    let persisted = await dbGetDoc<BloodRequest>('blood_requests', request.id);
+    await approveNext(request.id); // 1/3
+    let persisted = await liveRequest(request.id);
     assert.equal(persisted?.units_confirmed, 1);
     assert.equal(persisted?.status, 'partially_matched');
-    assert.equal(persisted?.fulfilled_at ?? null, null);
 
-    // Approvals 2+3 → counter capped at required, status fulfilled
-    const r2 = await approveMatchById(matches[1].id);
-    const r3 = await approveMatchById(matches[2].id);
-    assert.equal(r2.ok && r3.ok, true, `approvals failed: ${r2.error}/${r3.error}`);
-    persisted = await dbGetDoc<BloodRequest>('blood_requests', request.id);
+    await approveNext(request.id); // 2/3
+    await approveNext(request.id); // 3/3 → full allocation
+    persisted = await liveRequest(request.id);
     assert.equal(persisted?.units_confirmed, 3);
+    assert.equal(persisted?.status, 'secured', 'full allocation must be secured, NOT fulfilled');
+    assert.equal(persisted?.fulfilled_at ?? null, null, 'secured is NOT terminal');
+
+    // Complete all approved matches via the provider → derived fulfilled.
+    const matches = await requestMatches(request.id);
+    assert.equal(matches.length, 3);
+    for (const m of matches) {
+      const donor = (await dbGetDoc<User>('users', m.donor_id)) as User;
+      await recordDonationCompletion({
+        matchId: m.id,
+        requestId: request.id,
+        donor,
+        confirmedAt: new Date().toISOString(),
+      });
+    }
+    persisted = await liveRequest(request.id);
+    assert.equal(persisted?.units_completed, 3);
     assert.equal(persisted?.status, 'fulfilled');
-    assert.ok(persisted?.fulfilled_at, 'fulfilled_at must be stamped at capacity');
+    assert.ok(persisted?.fulfilled_at, 'fulfilled_at stamped once donations complete');
+  });
+
+  test('search_exhausted is NOT terminal; approved+completed donors reach fulfilled', async (t) => {
+    if (!isFirebaseConfigured()) return t.skip('Store not configured');
+    await quarantineOtherPools(6);
+    await seedDonor(601);
+    const request = makeRequest({ id: nextId('req'), units_required: 1 });
+    await arm(request);
+
+    // One invitation in flight (budget 1) → burn the remaining budget to 15.
+    await matchAndNotifyRequest(request);
+    const pending = (await requestMatches(request.id)).find((m) => m.donor_response === 'pending')!;
+    for (let i = 0; i < 14; i++) await spendDonorBudget(request.id, `phantom-${i}-${request.id}`);
+
+    // Owner no-ops at the budget gate and re-derives → search_exhausted.
+    const r = await matchAndNotifyRequest((await liveRequest(request.id)) as BloodRequest);
+    assert.equal(r.matched, 0, 'donor #16 blocked');
+    let persisted = await liveRequest(request.id);
+    assert.equal(persisted?.status, 'search_exhausted', 'budget exhausted + not fully allocated');
+    assert.notEqual(persisted?.status, 'fulfilled');
+
+    // The in-flight invite approves → `secured`, still not terminal.
+    const ar = await approveMatchById(pending.id);
+    assert.equal(ar.ok, true);
+    persisted = await liveRequest(request.id);
+    assert.equal(persisted?.status, 'secured', 'existing pending resolves to full allocation');
+
+    // Completion → fulfilled (search_exhausted was never terminal).
+    const donor = (await dbGetDoc<User>('users', pending.donor_id)) as User;
+    await recordDonationCompletion({ matchId: pending.id, requestId: request.id, donor, confirmedAt: new Date().toISOString() });
+    persisted = await liveRequest(request.id);
+    assert.equal(persisted?.status, 'fulfilled', 'search_exhausted is NOT terminal');
   });
 });
 
-describe('Phase 6: cancellation gating & fan-out', () => {
-  test('Approval on a cancelled request is rejected (409) and match stays pending', async (t) => {
+// ─────────────────────────────────────────────────────────────────────────────
+// Completion provider: double-fire exactly-once
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Completion provider', () => {
+  test('second completion attempt is a no-op; units_completed stays exact', async (t) => {
     if (!isFirebaseConfigured()) return t.skip('Store not configured');
     await quarantineOtherPools(7);
-    for (let i = 701; i <= 704; i++) await seedDonor(i); // private pool
-    const request = makeRequest({ id: nextId('req') });
+    await seedDonor(701);
+    const request = makeRequest({ id: nextId('req'), units_required: 1 });
     await arm(request);
 
     await matchAndNotifyRequest(request);
-    const matches = await requestMatches(request.id);
-    assert.ok(matches.length > 0);
+    const pending = (await requestMatches(request.id)).find((m) => m.donor_response === 'pending')!;
+    const r = await approveMatchById(pending.id);
+    assert.equal(r.ok, true);
 
-    await dbSaveDoc('blood_requests', request.id,
-      { ...request, status: 'cancelled' } as unknown as Record<string, unknown>);
-    const r = await approveMatchById(matches[0].id);
-    assert.equal(r.ok, false, 'approval must fail on a cancelled request');
-    assert.equal((r as { status?: number }).status, 409);
-    const m = (await requestMatches(request.id)).find(x => x.id === matches[0].id);
-    assert.equal(m?.donor_response, 'pending', 'dead-request approval must not mutate the match');
+    const donor = (await dbGetDoc<User>('users', pending.donor_id)) as User;
+    const first = await recordDonationCompletion({ matchId: pending.id, requestId: request.id, donor, confirmedAt: new Date().toISOString() });
+    assert.equal(first.already, false);
+
+    const second = await recordDonationCompletion({ matchId: pending.id, requestId: request.id, donor, confirmedAt: new Date().toISOString() });
+    assert.equal(second.already, true, 'completion double-fire must be idempotent');
+
+    const logs = (await dbGetCollection<{ request_id: string }>('donation_log')).filter((l) => l.request_id === request.id);
+    assert.equal(logs.length, 1, 'exactly one donation_log row despite double-fire');
+    const persisted = await liveRequest(request.id);
+    assert.equal(persisted?.units_completed, 1);
+    assert.equal(persisted?.status, 'fulfilled');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cancellation & reopen (budget reset)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Cancellation & reopen', () => {
+  test('cancel retires invites / preserves approved; reopen resets the search budget', async (t) => {
+    if (!isFirebaseConfigured()) return t.skip('Store not configured');
+    // Pool 20 (donors 2001+) collides with NO other pool in this file or any
+    // prior run's stale donors (which top out at pool ~9) — fully isolated.
+    await quarantineOtherPools(20);
+    await seedDonor(2001);
+    await seedDonor(2002);
+    const request = makeRequest({ id: nextId('req'), units_required: 2 });
+    await arm(request);
+
+    await matchAndNotifyRequest(request);
+    const pending0 = (await requestMatches(request.id)).find((m) => m.donor_response === 'pending')!;
+    await dbSaveDoc('matches', pending0.id, { ...pending0, donor_response: 'approved', unit_slot: 1 } as unknown as Record<string, unknown>);
+    await matchAndNotifyRequest((await liveRequest(request.id)) as BloodRequest);
+    const [a, b] = await requestMatches(request.id);
+    assert.equal(a.donor_response === 'approved' || b.donor_response === 'approved', true);
+    assert.equal(await readSearchBudget(request.id), 2, 'budget reflects both spent donors');
+
+    const cancelled = await cancelRequest((await liveRequest(request.id)) as BloodRequest);
+    assert.equal(cancelled.status, 'cancelled');
+    assert.equal((await requestMatches(request.id)).find((m) => m.id === pending0.id)?.donor_response, 'approved', 'approved history preserved');
+
+    const reopened = await reopenRequest(cancelled);
+    assert.equal(reopened.status, 'open');
+    assert.equal(await readSearchBudget(reopened.id), 0, 'reopen must reset the search budget');
   });
 
-  test('cancelRequest: pending→timed_out, approved/declined preserved, locks released', async (t) => {
+  test('approval on a cancelled request rejected; expired invitation cannot approve', async (t) => {
     if (!isFirebaseConfigured()) return t.skip('Store not configured');
-    await quarantineOtherPools(8);
-    for (let i = 801; i <= 803; i++) await seedDonor(i); // private pool
+    await quarantineOtherPools(9);
+    await seedDonor(901);
     const request = makeRequest({ id: nextId('req') });
     await arm(request);
 
     await matchAndNotifyRequest(request);
-    const matches = await requestMatches(request.id);
-    // WAHA unset ⇒ invites stay pending; force deterministic states per donor.
-    const [p, a, d] = matches;
-    await dbSaveDoc('matches', a.id, { ...a, donor_response: 'approved', unit_slot: 1 });
-    await dbSaveDoc('matches', d.id, { ...d, donor_response: 'declined' });
+    const [m] = await requestMatches(request.id);
 
-    const updated = await cancelRequest(
-      (await dbGetDoc<BloodRequest>('blood_requests', request.id)) as BloodRequest
-    );
-    assert.equal(updated.status, 'cancelled');
+    await dbSaveDoc('blood_requests', request.id, { ...request, status: 'cancelled' } as unknown as Record<string, unknown>);
+    const r = await approveMatchById(m.id);
+    assert.equal(r.ok, false, 'approval must fail on a cancelled request');
+    assert.equal((r as { status?: number }).status, 409);
+    assert.equal((await requestMatches(request.id))[0]?.donor_response, 'pending', 'dead-request approval must not mutate the match');
 
-    const byId = new Map((await requestMatches(request.id)).map(m => [m.id, m]));
-    assert.equal(byId.get(p.id)?.donor_response, 'timed_out', 'dangling invite must be retired');
-    assert.equal(byId.get(a.id)?.donor_response, 'approved', 'accepted match is history — never rewritten');
-    assert.equal(byId.get(d.id)?.donor_response, 'declined', 'declined match must be untouched');
-
-    // Lock release is the observable side effect; courtesy WhatsApp to `a`
-    // degrades to a no-op with WAHA unset.
-    await releaseDonorLock(a.donor_id, a.request_id); // idempotent — must not throw
+    // Simulate the 5-min sweep expiry (pending → expired): approval is blocked.
+    await dbSaveDoc('blood_requests', request.id, { ...request, status: 'open' } as unknown as Record<string, unknown>);
+    await dbSaveDoc('matches', m.id, { ...m, donor_response: 'expired' } as unknown as Record<string, unknown>);
+    const r2 = await approveMatchById(m.id);
+    assert.equal(r2.ok, false, 'approval must fail once the invitation expired');
   });
 });

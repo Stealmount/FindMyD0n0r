@@ -19,7 +19,7 @@ interface RequestsProps {
 
 const STATUS_PILLS = [
   { value: '', label: 'All', hi: 'सभी' },
-  { value: 'active', label: 'Active', hi: 'सक्रिय', statuses: ['open', 'broadcasting', 'matching', 'partially_matched'] },
+  { value: 'active', label: 'Active', hi: 'सक्रिय', statuses: ['open', 'broadcasting', 'matching', 'partially_matched', 'secured', 'search_exhausted'] },
   { value: 'fulfilled', label: 'Fulfilled', hi: 'पूर्ण', statuses: ['fulfilled'] },
   { value: 'cancelled', label: 'Cancelled', hi: 'रद्द', statuses: ['cancelled'] },
   { value: 'expired', label: 'Expired', hi: 'समाप्त', statuses: ['expired'] },

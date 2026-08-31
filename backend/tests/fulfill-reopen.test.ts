@@ -100,6 +100,18 @@ test('fulfillRequest: exact-full request is signed off as fulfilled with truthfu
     const donorId = `${d}_${tag()}`;
     await seedUser(donorId);
     await seedMatch(`m_${donorId}`, request.id, donorId, 'approved', slot);
+    // Fix 1: fulfilled requires COMPLETED donations, not approval alone. Seed the
+    // request-keyed donation_log row for each completed unit so the request can
+    // legitimately reach 'fulfilled'.
+    await dbSaveDoc('donation_log', `donation_m_${donorId}`, {
+      id: `donation_m_${donorId}`,
+      donor_id: donorId,
+      match_id: `m_${donorId}`,
+      request_id: request.id,
+      donation_date: nowISO().split('T')[0],
+      source: 'platform_match',
+      created_at: nowISO(),
+    });
   }
 
   const updated = await fulfillRequest(await dbGetDoc<BloodRequest>('blood_requests', request.id) as BloodRequest);
@@ -192,6 +204,8 @@ test('reopenRequest: approved allocation retained (ledger coherent), fresh round
 
   const persisted = await dbGetDoc<BloodRequest>('blood_requests', request.id);
   assert.equal(persisted?.units_confirmed, 3);
-  assert.equal(persisted?.status, 'fulfilled', '3/3 reached — request truly fulfilled');
-  assert.ok(persisted?.fulfilled_at, 'fulfilled_at stamped only now, at real capacity');
+  // D3: full ALLOCATION is `secured` (not terminal); `fulfilled` requires
+  // completed donations, so a fully-reserved request must never read fulfilled.
+  assert.equal(persisted?.status, 'secured', '3/3 allocation is secured, NOT fulfilled');
+  assert.equal(persisted?.fulfilled_at ?? null, null, 'secured is not terminal — no fulfilled_at');
 });

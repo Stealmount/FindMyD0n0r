@@ -22,8 +22,10 @@ import {
   ACTIVE_REQUEST_STATUSES,
   matchAndNotifyRequest,
   releaseDonorLock,
+  expireMatchIfPending,
   transitionRequestStatusIfActive,
 } from "../services/matchingEngine";
+import { INVITATION_TIMEOUT_MINUTES } from "../src/types";
 
 // Append-only audit trail — writes to request_events collection
 async function logRequestEvent(requestId: string, event: string, actor: string = "system") {
@@ -38,7 +40,7 @@ async function logRequestEvent(requestId: string, event: string, actor: string =
 
 const WORKER_LOCK_KEY = "bg_worker_running";
 const WORKER_LOCK_TTL_S = 120; // 2 minutes — prevents overlapping runs
-const STALE_MATCH_MINUTES = 30; // auto-expire pending matches after 30 min
+const STALE_MATCH_MINUTES = 30; // backstop: auto-expire pending matches older than 30 min (see Step 2)
 
 export async function runBackgroundMatchWorker() {
   // Acquire a Redis lock to prevent overlapping runs (e.g. PM2 cluster)
@@ -118,9 +120,12 @@ export async function runBackgroundMatchWorker() {
       log.error("Reconciliation sweep failed", { err: e?.message });
     }
 
-    // ——— Step 2: Auto-expire stale pending matches (>30 min no reply) ———
+    // ——— Step 2: Auto-expire stale pending matches after the 5-min donor response
+    // window, then advance the single owner (sequential 5 → 5 → 5 model). STALE_MATCH_MINUTES
+    // (30) remains the documented backstop for a delayed/overlapping worker — the same
+    // loop catches any pending invite older than 5 min, so a longer wait is redundant.
     const allMatches = await dbGetCollection<Match>("matches");
-    const staleThreshold = new Date(now.getTime() - STALE_MATCH_MINUTES * 60 * 1000);
+    const staleThreshold = new Date(now.getTime() - INVITATION_TIMEOUT_MINUTES * 60 * 1000);
 
     for (const match of allMatches) {
       if (
@@ -128,12 +133,12 @@ export async function runBackgroundMatchWorker() {
         match.created_at &&
         new Date(match.created_at) < staleThreshold
       ) {
-        // Mark match as expired
-        await dbSaveDoc("matches", match.id, {
-          ...match,
-          donor_response: "expired",
-          donor_response_at: nowISO(),
-        } as unknown as Record<string, unknown>);
+        // C-1: expire only if the LIVE match is still pending. A donor who
+        // approved concurrently (atomic claim) must never have their approval
+        // overwritten back to expired by this stale worker snapshot.
+        const transitioned = await expireMatchIfPending(match.id, nowISO());
+        if (!transitioned) continue;
+
         await releaseDonorLock(match.donor_id, match.request_id);
         staleExpired++;
 

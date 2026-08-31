@@ -55,6 +55,7 @@ export default function DonorProfileSettings({ currentUser, onLoginSuccess, onNa
   const [weightError, setWeightError] = useState<string | null>(null);
   const [editAvail, setEditAvail] = useState<AvailabilityStatus>(currentUser.availability_status || 'available');
   const [editEmergency, setEditEmergency] = useState(Boolean(currentUser.emergency_only));
+  const [editCooldown, setEditCooldown] = useState<number>(currentUser.cooldown_days ?? 90);
   const [savingStep3, setSavingStep3] = useState(false);
 
   // ── Progressive reveal state ──
@@ -77,6 +78,7 @@ export default function DonorProfileSettings({ currentUser, onLoginSuccess, onNa
     setEditWeightKg(currentUser.weight_kg != null ? String(currentUser.weight_kg) : '');
     setEditAvail(currentUser.availability_status || 'available');
     setEditEmergency(Boolean(currentUser.emergency_only));
+    setEditCooldown(currentUser.cooldown_days ?? 90);
     setWaInput(toDisplay((currentUser as any).whatsapp_number || null));
   }, [currentUser]);
 
@@ -169,7 +171,7 @@ export default function DonorProfileSettings({ currentUser, onLoginSuccess, onNa
     setSavingStep3(true);
     try {
       const weightNum = editWeightKg.trim() !== '' ? Number(editWeightKg) : undefined;
-      const updatedUser: User = { ...currentUser, weight_kg: weightNum, availability_status: editAvail, emergency_only: editEmergency, profile_complete: true, updated_at: new Date().toISOString() };
+      const updatedUser: User = { ...currentUser, weight_kg: weightNum, availability_status: editAvail, emergency_only: editEmergency, cooldown_days: (editCooldown as 60 | 90 | 120), profile_complete: true, updated_at: new Date().toISOString() };
       await authenticatedApi('/api/donor-profile/complete', {
         blood_group: editBloodGroup, pincode: editPincode, area: editArea, city: editCity, weight_kg: weightNum,
         last_donation_date: currentUser.last_donation_date ?? null,
@@ -178,6 +180,7 @@ export default function DonorProfileSettings({ currentUser, onLoginSuccess, onNa
         number_sharing_pref: currentUser.number_sharing_pref ?? 'on_approval',
       }, 'PATCH');
       try { await authenticatedApi('/api/donor-profile/availability', { isAvailable: editAvail === 'available' }, 'PATCH'); } catch (availErr) { console.error('Availability sync failed:', availErr); }
+      try { await authenticatedApi('/api/donor-profile/cooldown', { cooldown_days: editCooldown }, 'PATCH'); } catch (cdErr) { console.error('Cooldown preference sync failed:', cdErr); }
       onLoginSuccess(updatedUser);
       showToast(isHi ? 'प्रोफ़ाइल और सेटिंग्स सहेजी गईं।' : 'Profile and settings saved.', 'success');
     } catch (err) { console.error(err); showToast(isHi ? 'सहेजने में विफल।' : 'Failed to save.', 'error'); }
@@ -336,6 +339,18 @@ export default function DonorProfileSettings({ currentUser, onLoginSuccess, onNa
             <div className="flex items-center justify-between gap-3 border border-ink-200 bg-ink-50 p-3">
               <div className="space-y-0.5 min-w-0"><span className="text-[12px] font-semibold text-ink-900">Emergency Only</span><p className="text-[10px] leading-snug text-ink-500">Only notify on critical requests</p></div>
               <input type="checkbox" checked={editEmergency} onChange={e => setEditEmergency(e.target.checked)} className="h-4 w-4 shrink-0 accent-blood-600 cursor-pointer" />
+            </div>
+            <div className="space-y-1.5">
+              <label htmlFor="settings-cooldown" className={labelCls}>{isHi ? 'दान के बाद कूलडाउन अवधि' : 'Post-Donation Cooldown Period'}</label>
+              <div className="relative">
+                <select id="settings-cooldown" value={editCooldown} onChange={e => setEditCooldown(Number(e.target.value))} className="h-10 w-full appearance-none border border-ink-300 bg-white px-3 pr-9 text-sm font-semibold text-ink-900 outline-none transition-colors duration-150 focus:border-blood-600">
+                  <option value={60} className="text-ink-900">60 days</option>
+                  <option value={90} className="text-ink-900">90 days</option>
+                  <option value={120} className="text-ink-900">120 days</option>
+                </select>
+                <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-400" />
+              </div>
+              <p className="text-[10px] leading-snug text-ink-500">{isHi ? 'रक्तदान के बाद आप कितने समय बाद पुनः दान करने के लिए उपलब्ध रहेंगे।' : 'How long after a donation before you can be matched again.'}</p>
             </div>
             <div className="flex flex-col sm:flex-row gap-2 pt-1">
               <button type="submit" disabled={savingStep3} className="flex min-h-[44px] flex-1 items-center justify-center gap-2 bg-blood-600 text-[13px] font-semibold text-white transition-colors hover:bg-blood-700 cursor-pointer disabled:cursor-not-allowed disabled:opacity-50">

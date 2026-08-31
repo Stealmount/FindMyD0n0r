@@ -1,5 +1,5 @@
 // Tracking routes — extracted from server.ts (Phase 3 decomposition, 3.6.6)
-// Owns: SOS request creation, public tracking lookup, requester cancel/reopen/fulfill/broadcast-toggle
+// Owns: SOS request creation, public tracking lookup, requester cancel/reopen/fulfill
 import express, { Router } from "express";
 import { randomUUID, randomBytes } from "node:crypto";
 import { getCollection as dbGetCollection, getDoc as dbGetDoc, saveDoc as dbSaveDoc } from "../src/lib/serverDb";
@@ -8,7 +8,7 @@ import { getAuthenticatedUser, getLinkedProfile, consumeOtpTicket } from "../mid
 import rateLimitMiddleware from "../middleware/rateLimiter";
 import { normalizePhone, isValidIndianPhone } from "../helpers/phone";
 import { nowISO } from "../helpers/time";
-import { matchAndNotifyRequest, releaseDonorLock, TERMINAL_REQUEST_STATUSES } from "../services/matchingEngine";
+import { matchAndNotifyRequest, releaseDonorLock, TERMINAL_REQUEST_STATUSES, resetSearchBudget } from "../services/matchingEngine";
 import { sendErrorResponse, UnauthorizedError, NotFoundError, ForbiddenError, ValidationError, AppError } from "../helpers/errors";
 import { sendDonorWhatsApp } from "../src/lib/waha";
 import { buildRequestCancelledDonorNotice } from "../services/notificationService";
@@ -52,7 +52,7 @@ async function logRequestEvent(requestId: string, event: string, actor: string =
 // complete-verification, accountSettings link-google) — and any phone signup
 // whose email is null — got 403 on cancel/fulfill/reopen even though they own
 // the request. Authorize against the same identity chain used at creation.
-const checkRequesterAuth = async (req: express.Request, request: BloodRequest) => {
+export const checkRequesterAuth = async (req: express.Request, request: BloodRequest) => {
   const authUser = await getAuthenticatedUser(req);
   if (authUser) {
     if (authUser.id && authUser.id === request.requester_id) return true;
@@ -459,6 +459,7 @@ export async function reopenRequest(request: BloodRequest): Promise<BloodRequest
   // units_confirmed from live approved matches and reset search_batch so a fresh
   // wave of donors can be searched for the still-open units.
   const lifecycle = await recomputeUnitsConfirmed(request.id, request.units_required);
+  await resetSearchBudget(request.id);
   const updated = {
     ...request,
     status: "open" as const,
@@ -503,6 +504,13 @@ export async function fulfillRequest(request: BloodRequest): Promise<BloodReques
   // Phase 5: stamp the counter if approvals never wrote it (manual fulfill).
   // Phase 2: routed through the same lifecycle helper so the fulfilled
   // transition and units_confirmed agree with every other approval site.
+  // D3: `fulfilled` is ONLY derived from COMPLETED donations
+  // (completed >= required) — never from approvals alone (`secured`, which is
+  // fully-allocated-but-not-yet-donated). A manual requester sign-off therefore
+  // only stamps `fulfilled` when donations have actually completed. A `secured`
+  // request is left open (NOT cancelled) so the pending donation can still
+  // advance it to `fulfilled` when it completes via the provider. Any
+  // under-allocated request falls through to the cancel-domain close below.
   const lifecycle = await recomputeUnitsConfirmed(request.id, request.units_required);
   if (lifecycle.status === "fulfilled") {
     const updated = {
@@ -535,6 +543,18 @@ export async function fulfillRequest(request: BloodRequest): Promise<BloodReques
     logRequestEvent(request.id, "fulfilled", request.requester_id).catch(() => {});
     return updated;
   }
+  if (lifecycle.status === "secured") {
+    // Fully allocated (all donors YES) but no donation has completed yet —
+    // fulfilled must not be stamped on approvals alone. Leave the request open
+    // (NOT cancelled) so the in-flight donation completing via the provider can
+    // advance `secured → fulfilled`. Reflect the authoritative confirmed count.
+    const heldOpen = {
+      ...request,
+      units_confirmed: lifecycle.units_confirmed,
+      updated_at: nowISO(),
+    };
+    return heldOpen;
+  }
   // Under-filled manual close: reuse the established cancel domain flow —
   // never stamp 'fulfilled' on a request whose allocation is incomplete.
   await cancelRequest(request);
@@ -560,16 +580,6 @@ router.patch("/api/requests/:trackingCode/fulfill", wrap(async (req, res) => {
   // transition + fan-out (no duplicate cleanup / events / notifications).
   const { request: updated, idempotent } = await closeRequestIdempotently(r, fulfillRequest);
   return res.json({ success: true, request: updated, idempotent });
-}));
-
-// ─── PATCH /api/requests/:trackingCode/broadcast-toggle ──────────────────────
-router.patch("/api/requests/:trackingCode/broadcast-toggle", wrap(async (req, res) => {
-  const all = await dbGetCollection<BloodRequest>("blood_requests");
-  const r = all.find(x => x.tracking_code === req.params.trackingCode || x.id === req.params.trackingCode);
-  if (!r) return sendErrorResponse(res, new NotFoundError("Request not found"));
-  if (!await checkRequesterAuth(req, r)) return sendErrorResponse(res, new ForbiddenError("Unauthorized"));
-  await dbSaveDoc("blood_requests", r.id, { ...r, broadcast_to_simulator: !r.broadcast_to_simulator });
-  return res.json({ success: true });
 }));
 
 export default router;
